@@ -72,7 +72,6 @@ queue_size_required = 10  # 10 players required for 5v5
 reset_queue_votes_required = 4  # Require 4 votes to reset the queue
 votes_required = 5  # Require 5 votes to pick maps, matchups, or re-roll
 map_total_votes_required = 7  # Require 7 total votes to choose a map
-queue_file_path = 'stored_queue.txt'
 
 # Helper function to reset the game state but keep the waiting room intact
 def reset_game():
@@ -306,13 +305,13 @@ class ReadyUpView(View):
         else:
             await interaction.response.send_message('You are not in the queue or already ready.', ephemeral=True)
             
-    @discord.ui.button(label='Decline Queue', style=discord.ButtonStyle.red)
+    @discord.ui.button(label='Bail Out', style=discord.ButtonStyle.red)
     async def decline_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         global game_in_progress
         user = interaction.user
         if user in queue:
             if user in ready_players:
-                await interaction.response.send_message('Cannot decline queue after clicking ready.', ephemeral=True)
+                interaction.response.send_message('Cannot decline queue after clicking ready.', ephemeral=True)
             elif user in decline_ready_players:
                 if game_in_progress:
                     game_in_progress = False
@@ -427,14 +426,14 @@ async def update_map_voting_message():
     if map_voting_message:
         embed = discord.Embed(title='Map Voting', description='Vote for the map you want to play on.', color=discord.Color.green())
         for map_name in map_choices:
-            embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=False)
+            embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=True)
         await map_voting_message.edit(embed=embed)
 
 # Function to declare the selected map and proceed to matchups
 async def declare_selected_map(channel, selected_map):
     await channel.send(f"The selected map is **{selected_map}**!")
     # Proceed to matchup voting
-    await proceed_to_matchups_phase(channel)   
+    await proceed_to_matchups_phase(channel)
 
 # Adjusted function to proceed to matchups
 async def proceed_to_matchups_phase(channel):
@@ -442,18 +441,26 @@ async def proceed_to_matchups_phase(channel):
     phase = Phase.MATCHUP
     players = list(ready_players)
     matchups = []
+    unique_team_ids = set()
     votes.clear()  # Clear votes only at the start of new matchups
     voted_users.clear()  # Reset users who voted
 
     # Generate matchups for 5v5
+    while len(matchups) < 3:
     for _ in range(3):
         random.shuffle(players)
         team1 = players[:5]  # 5 players on team 1
         team2 = players[5:]  # 5 players on team 2
         team1.sort(key=get_display_name)
         team2.sort(key=get_display_name)
-        matchups.append((team1.copy(), team2.copy()))
-
+        team1_ids = ' '.join([str(user.id) for user in team1])
+        team2_ids = ' '.join([str(user.id) for user in team2])
+        # check to make sure that generated matchup is unique before adding it
+        if team1_ids not in unique_team_ids:
+            unique_team_ids.add(team1_ids)
+            unique_team_ids.add(team2_ids)
+            matchups.append((team1.copy(), team2.copy()))
+            
     # Display the matchups
     await display_matchup_votes(channel)
 
@@ -468,14 +475,13 @@ async def display_matchup_votes(channel):
         team2_names = '\n'.join([get_display_name(user) for user in team2])
         embed.add_field(name='Team 1', value=team1_names, inline=True)
         embed.add_field(name='Team 2', value=team2_names, inline=True)
-        embed.add_field(name=f'Matchup {idx} ({votes[idx]} votes)',
+        embed.add_field(name=f'▲▲▲ Matchup {idx} ({votes[idx]} votes) ▲▲▲',
                         value='——————————————————————',
                         inline=False)
 
     # Clearer re-roll option with votes
     embed.add_field(name=f'Re-roll Matchups ({reroll_votes} votes)',
-                    value='Vote to re-roll all matchups and generate new ones.', 
-                    inline=False)
+                    value='Vote to re-roll all matchups and generate new ones.', inline=False)
 
     # If the voting message exists, edit it, otherwise send a new one
     if voting_message:
@@ -820,61 +826,6 @@ async def start_pug(ctx):
            view=QueueView())
    else:
        await ctx.send('A game is already in progress or the queue is active.')
-       
-# Command to start the PUG system in the gig esports #pugs-queue channel
-@bot.command(name='start_pug_gigesports')
-async def start_pug(ctx):
-   global phase, queue_message
-   if not game_in_progress and not queue:
-       phase = Phase.QUEUE
-       queue_channel = ctx.guild.get_channel(1293818329118539847)
-       queue_message = await queue_channel.send(
-           embed=discord.Embed(title="PUGs Queue", description="No players in queue.", color=discord.Color.blue()),
-           view=QueueView())
-   else:
-       await ctx.send('A game is already in progress or the queue is active.')
-       
-# Command to manually add users to the queue
-@bot.command(name='queue_users')
-async def queue_users(ctx, members: commands.Greedy[discord.Member], *):
-    if not game_in_progress and queue:
-        for member in members:
-            queue.add(member.user)
-      await ctx.send(f'Added {len(members)} players to queue.')
-    else:
-      await ctx.send('Cannot queue players, a game is already in progress.')
-      
-# Command to store the current queue to a file
-@bot.command(name='store_queue')
-async def store_queue(ctx):
-   if not game_in_progress and queue:
-      with open(queue_file_path, 'w') as queue_file:
-         queue_file.write('\n'.join(str(user.id) for user in queue))
-      await ctx.send(f'Queue stored with {len(queue)} players.')
-   else:
-      await ctx.send('Cannot store queue, a game is already in progress.')
-      
-# Command to restore the saved queue from a file
-@bot.command(name='restore_queue')
-async def restore_queue(ctx):
-   global queue
-   if not game_in_progress:
-      if os.path.isfile(queue_file_path):
-          queue = []
-          with open(queue_file_path, 'r') as queue_file:
-              for id_line in queue_file:
-                try:
-                    user_id = int(id_line.strip())
-                    user = await ctx.bot.fetch_user(user_id)
-                    queue.add(user)
-                except ValueError:
-                    
-          os.remove(queue_file_path)
-          await ctx.send(f'Queue restored with {len(queue)} players.')
-      else:
-          await ctx.send('No saved queue found.')
-   else:
-      await ctx.send('Cannot restore queue, a game is already in progress.')
 
 
 # Run the bot
