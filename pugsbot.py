@@ -4,7 +4,7 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime
 import time
-from enum import Enum
+from enum import IntEnum
 import math
 
 import discord
@@ -35,18 +35,20 @@ async def on_ready():
     print(f'{get_timestamp()} - Logged in as {bot.user.name}')
 
 # Phase enum
-class Phase(Enum):
+class Phase(IntEnum):
     NONE = 1
     QUEUE = 2
     READY = 3
     MAP = 4
     MATCHUP = 5
     PLAY = 6
+    RESET = 7
     
 # Global variables to keep track of the queue and game states
 phase = Phase.NONE
-queue = []
-waiting_room = []
+queue = []  # Players in queue
+waiting_room = []  # Players in waiting room
+re_queue = []  # Players re-queueing after current game
 ready_players = set()
 decline_ready_players = set()
 matchups = []
@@ -62,6 +64,7 @@ waiting_room_message = None  # For the waiting room message
 ready_message = None  # To store the ready-up message
 ready_start = 0  # for storing the timestamp of the start of the ready up countdown
 ready_end = 0  # for storing the timestamp of the end of the ready up countdown
+all_ready_sent = False  # Track if the all players ready has been sent
 final_matchup_sent = False  # Track if the final matchup has already been sent
 ready_up_task = None  # For tracking the countdown task
 reset_in_progress = False  # Flag to prevent multiple resets
@@ -88,7 +91,7 @@ save_file_path = 'stored_pug.txt'  # Stores saved PUG data to load on next start
 # Helper function to reset the game state but keep the waiting room intact
 def reset_game():
     global phase, queue, ready_players, decline_ready_players, matchups, votes, voted_users, reroll_votes, reset_queue_votes, reset_voted_users
-    global game_in_progress, queue_message, voting_message, final_matchup_sent, ready_message, ready_up_task, reset_in_progress, final_matchup_players
+    global game_in_progress, queue_message, voting_message, all_ready_sent, final_matchup_sent, ready_message, ready_up_task, reset_in_progress, final_matchup_players
     global map_votes, map_voted_users, map_voting_message, selected_map, selected_map_sent
     phase = Phase.QUEUE
     queue = []
@@ -106,6 +109,7 @@ def reset_game():
     ready_message = None
     ready_start = 0
     ready_end = 0
+    all_ready_sent = False
     
     final_matchup_sent = False
     final_matchup_players = set()
@@ -135,8 +139,16 @@ def user_sort_key(user):
 def queue_embed():
     queue_names = ', '.join([get_display_name(user) for user in queue]) or 'No players in queue.'
     embed = discord.Embed(title='PUGs Queue',
-                          description=f'Players in queue ({len(queue)}/{queue_size_required}): {queue_names}',
+                          #description=f'Players in queue ({len(queue)}/{queue_size_required}): {queue_names}',
                           color=discord.Color.blue())
+    embed.add_field(name=f'In Queue ({len(queue)}/{queue_size_required})', value=queue_names, inline=False)
+    if phase < Phase.PLAY:
+        if waiting_room:
+            waiting_names = ', '.join([get_display_name(user) for user in waiting_room])
+            embed.add_field(name=f'Waiting Room ({len(waiting_room)})', value=waiting_names, inline=False)
+        if re_queue and phase > Phase.READY:
+            re_queue_names = ', '.join([get_display_name(user) for user in re_queue])
+            embed.add_field(name=f'Re-Queueing ({len(re_queue)})', value=re_queue_names, inline=False)
     return embed
 
 # View for the join/leave queue buttons
@@ -145,60 +157,86 @@ class QueueView(View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
-    async def join_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # do nothing if no longer in queue phase
-        if phase != Phase.QUEUE:
-            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
-            return
-            
-        user = interaction.user
-        if len(queue) >= queue_size_required:
-            await interaction.response.send_message(f'{user.mention}, the queue is full!', ephemeral=True)
-        elif user not in queue:
-            if user in final_matchup_players:
-                await interaction.response.send_message(
-                    f'{user.mention}, you are in the last matchup and can only join after others.', ephemeral=True)
-                return
-            queue.append(user)
-            await interaction.response.send_message(f'{user.mention} joined the queue!', ephemeral=True)
-        else:
-            await interaction.response.send_message('You are already in the queue.', ephemeral=True)
-        await update_queue_message()
+    async def join_queue(self, interaction: discord.Interaction, button: discord.ui.Button):          
+        await handle_queue_join(interaction)
 
     @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # do nothing if no longer in queue phase
-        if phase != Phase.QUEUE:
-            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+        await handle_queue_leave(interaction)
+
+# Function to handle when a user clicks a join button for queue or waiting room
+async def handle_queue_join(interaction: discord.Interaction):
+    user = interaction.user
+    if user in re_queue:
+        await interaction.response.send_message('You are already set to re-queue.', ephemeral=True)
+        return
+    if user in waiting_room:
+        await interaction.response.send_message('You are already in the waiting room.', ephemeral=True)
+        return
+    elif user in queue:
+        if phase > Phase.READY: # if past the ready phase, set player to re-queue
+            re_queue.append(user)
+            await interaction.response.send_message(f'{user.mention} is set to re-queue!', ephemeral=True)
+        else:
+            await interaction.response.send_message('You are already in the queue.', ephemeral=True)
             return
-        
-        user = interaction.user
-        if user in queue:
+    else:  # user not in queue or waiting room yet
+        if len(queue) < queue_size_required:  # if room in the queue add the user
+            queue.append(user)
+            await interaction.response.send_message(f'{user.mention} joined the queue!', ephemeral=True)
+        else:  # otherwise add to waiting room
+            waiting_room.append(user)
+            await interaction.response.send_message(f'{user.mention} joined the waiting room!', ephemeral=True)
+    
+    if phase == Phase.PLAY:
+        await update_waiting_room_message()
+    else:
+        await update_queue_message()
+    
+# Function to handle when a user clicks a leave button for queue or waiting room
+async def handle_queue_leave(interaction: discord.Interaction):
+    user = interaction.user
+    if user in re_queue:
+        re_queue.remove(user)
+        await interaction.response.send_message(f'{user.mention} will not re-queue!', ephemeral=True)
+    elif user in waiting_room:
+        waiting_room.remove(user)
+        await interaction.response.send_message(f'{user.mention} left the waiting room!', ephemeral=True)
+    elif user in queue:
+        if phase > Phase.READY: # if past the ready phase, player is already set to NOT re-queues:
+            await interaction.response.send_message('You already will not re-queue.', ephemeral=True)
+            return
+        elif phase == Phase.READY:  # todo: if during ready phase, player bails out
+            await interaction.response.send_message('You cannot leave the queue during Ready Up.', ephemeral=True)
+            return
+        else:  # if before the ready phase, player leaves queue
             queue.remove(user)
             await interaction.response.send_message(f'{user.mention} left the queue.', ephemeral=True)
-        else:
-            await interaction.response.send_message('You are not in the queue.', ephemeral=True)
+    else:
+        await interaction.response.send_message('You are not in the queue.', ephemeral=True)
+        return
+    
+    if phase == Phase.PLAY:
+        await update_waiting_room_message()
+    else:
         await update_queue_message()
-
-
 
 # Function to update the queue message (editing the original message)
 async def update_queue_message():
-    global queue_message, game_in_progress
+    global queue_message
     embed = queue_embed()
 
-    # Remove buttons if the ready check has started
-    if game_in_progress:
-        if queue_message:
-            await queue_message.edit(embed=embed, view=None)  # Remove the buttons once the ready check starts
-    else:
-        if queue_message:
-            await queue_message.edit(embed=embed, view=QueueView())
+    if queue_message:
+        if phase >= Phase.PLAY:
+            await queue_message.edit(embed=embed, view=None)  # Remove the buttons once the match is in progress
         else:
-            queue_message = await bot.get_channel(queue_message.channel.id).send(embed=embed, view=QueueView())
+            await queue_message.edit(embed=embed, view=QueueView())
+    else:
+        queue_message = await bot.get_channel(queue_message.channel.id).send(embed=embed, view=QueueView())
 
     # If we have the required number of players, move to ready check
-    await check_full_queue()
+    if phase < Phase.READY:
+        await check_full_queue()
 
 # Function that checks if we have the required number of players, and if so moves to ready check
 async def check_full_queue():
@@ -276,29 +314,24 @@ async def countdown_ready_up(channel):
 
 # Timeout action if not all players are ready
 async def ready_up_timeout(channel):
-    global game_in_progress
+    global phase, game_in_progress
     non_ready_players = set(queue) - ready_players
-
+    num_ready = len(ready_players)
+    num_non_ready = len(non_ready_players)
     # Remove non-ready players from queue
     for user in non_ready_players:
         queue.remove(user)
-
-    # If some players were ready but not all, re-add the ready players back into the queue
-    if len(ready_players) > 0:
-        await channel.send(f"Not all players were ready. Re-queuing {len(ready_players)} ready players.")
-        await remove_ready_message()  # Remove the ready check message and buttons
-        queue[:] = list(ready_players)  # Re-add the players who were ready back to the queue
-        ready_players.clear()  # Clear the ready players set for the next ready check
-        game_in_progress = False  # Reset game_in_progress to trigger a new ready check
-        await remove_old_queue_message()  # Remove the old queue message
-        await start_new_queue(channel)  # Post a new queue message with ready players
-    else:
-        # If no one is ready, fully reset the queue
-        await channel.send('Not enough players ready. Resetting queue completely.')
-        reset_game()
-        await remove_ready_message()  # Remove the ready check message and buttons
-        await remove_old_queue_message()  # Remove the old queue message
-        await start_new_queue(channel)
+    # move users from waiting room to queue
+    queue.extend(waiting_room[:num_non_ready])
+    del waiting_room[:num_non_ready]
+    ready_players.clear()  # Clear the ready players set for the next ready check
+    # Start new queue to trigger a new ready check
+    phase = Phase.QUEUE
+    game_in_progress = False
+    await channel.send(f"Not all players were ready. Re-queuing {num_ready} ready players.")
+    await remove_ready_message()  # Remove the ready check message and buttons
+    await remove_old_queue_message()  # Remove the old queue message
+    await start_new_queue(channel)  # Post a new queue message with ready players
 
 # Function to make the ready up embed
 def ready_up_embed():
@@ -306,11 +339,11 @@ def ready_up_embed():
     not_ready_players = set(queue) - ready_players
     not_ready_list = ', '.join([get_display_name(user) for user in not_ready_players]) or 'All players are ready.'
 
-    embed = discord.Embed(title='Ready Up Phase',
+    embed = discord.Embed(title='Match Found!',
                           #description='The queue is full! Please ready up by clicking the "Ready Up" button.',
                           color=discord.Color.green())
-    embed.add_field(name='Players Ready', value=f'{ready_list}', inline=False)
-    embed.add_field(name='Players Not Ready', value=f'{not_ready_list}', inline=False)
+    embed.add_field(name='Ready', value=f'{ready_list}', inline=False)
+    embed.add_field(name='Not Ready', value=f'{not_ready_list}', inline=False)
     embed.add_field(name='\u200b', value=f'-# Expires: <t:{ready_end}:R>', inline=False)
     return embed
 
@@ -321,6 +354,7 @@ class ReadyUpView(View):
 
     @discord.ui.button(label='Ready Up', style=discord.ButtonStyle.green)
     async def ready_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        global all_ready_sent
         user = interaction.user
         if user in queue and user not in ready_players:
             if user in decline_ready_players:
@@ -329,8 +363,10 @@ class ReadyUpView(View):
             await interaction.response.send_message(f'{user.mention} is ready!', ephemeral=True)
             await update_ready_up_message()  # Update the ready-up message with new players
             # Proceed immediately if all players are ready
-            if len(ready_players) == queue_size_required:
+            if len(ready_players) == queue_size_required and not all_ready_sent:
+                all_ready_sent = True
                 await proceed_to_map_voting(interaction.message.channel)
+                
         else:
             await interaction.response.send_message('You are not in the queue or already ready.', ephemeral=True)
             
@@ -351,26 +387,9 @@ class ReadyUpView(View):
 #        else:
 #            await interaction.response.send_message('You are not in the queue.', ephemeral=True)
 
-# New function to decline ready and go back to queue
-async def decline_and_requeue(user, channel):
-    global phase, ready_up_task
-    phase = Phase.READY
-    # Cancel the ready-up task to prevent it from running after this point
-    if ready_up_task is not None:
-        ready_up_task.cancel()
-        ready_up_task = None
-        
-    await channel.send(f"{get_display_name(user)} declined the queue. Re-queuing {len(queue) - 1} other players.")
-    await remove_ready_message()  # Remove the ready check message and buttons
-    queue.remove(user)    # Remove the player who declined from the queue
-    ready_players.clear()  # Clear the ready players set for the next ready check
-    decline_ready_players.clear()  # Clear the unconfirmed declined players set for the next ready check
-    await remove_old_queue_message()  # Remove the old queue message
-    await start_new_queue(channel)  # Post a new queue message with ready players
-
 # New function to proceed to map voting
 async def proceed_to_map_voting(channel):
-    global phase, map_votes, map_voted_users, map_voting_message, ready_up_task
+    global phase, re_queue, map_votes, map_voted_users, map_voting_message, ready_up_task
     phase = Phase.MAP
     # Cancel the ready-up task to prevent it from running after this point
     if ready_up_task is not None:
@@ -378,6 +397,8 @@ async def proceed_to_map_voting(channel):
         ready_up_task = None
 
     await remove_ready_message()  # Remove the ready check message and buttons
+    
+    re_queue = list(ready_players)  # set all ready players to requeue by default
 
     map_votes.clear()  # Clear votes only at the start of new matchups
     map_voted_users.clear()  # Reset users who voted
@@ -387,20 +408,25 @@ async def proceed_to_map_voting(channel):
 
     # Send the message with the MapVotingView
     map_voting_message = await channel.send(embed=embed, view=MapVotingView())
+    await update_queue_message() # single update of queue message for new phase
 
 # Function to make the map voting embed
 def map_voting_embed():
-    embed = discord.Embed(title='Map Voting', 
+    embed = discord.Embed(title='Map Vote', 
                           #description='Vote for the map you want to play on.', 
                           color=discord.Color.green())
     for map_name in map_choices:
-        embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=True)
+        embed.add_field(name=map_name, value=f'\u200b{"☑️ " * map_votes[map_name]}', inline=True)
+        #embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=True)
     # add extra empty fields so that there are 3 fields per row
     rem = len(map_choices) % 3
     if rem != 0:
         embed.add_field(name='\u200b', value='\u200b', inline=True)
     if rem == 1:
         embed.add_field(name='\u200b', value='\u200b', inline=True)
+        
+    if selected_map:
+        embed.add_field(name='Selected Map', value=selected_map, inline=False)
     return embed
 
 # Class for map voting
@@ -466,13 +492,17 @@ async def update_map_voting_message():
     global map_voting_message
     if map_voting_message:
         embed = map_voting_embed()
-        await map_voting_message.edit(embed=embed)
+        if phase != Phase.MAP:
+            await map_voting_message.edit(embed=embed, view=None)  # remove buttons if not voting
+        else:
+            await map_voting_message.edit(embed=embed)
 
 # Function to declare the selected map and proceed to matchups
 async def declare_selected_map(channel, selected_map):
-    await channel.send(f"The selected map is **{selected_map}**!")
+    #await channel.send(f"The selected map is **{selected_map}**!")
     # Proceed to matchup voting
     await proceed_to_matchups_phase(channel)
+    await update_map_voting_message()
 
 # Adjusted function to proceed to matchups
 async def proceed_to_matchups_phase(channel):
@@ -515,25 +545,34 @@ async def proceed_to_matchups_phase(channel):
 # Function to display the voting embed with votes count and enhanced readability
 async def display_matchup_votes(channel):
     global reroll_votes, voting_message
-    embed = discord.Embed(title='Matchup Voting', description='Vote for your preferred matchup or vote to re-roll.\n——————————————————————',
+    #embed = discord.Embed(title='Matchup Voting', description='Vote for your preferred matchup or vote to re-roll.\n——————————————————————',
+    embed = discord.Embed(title='Matchup Vote', description='Vote for your preferred matchup or vote to re-roll.',
                           color=discord.Color.green())
 
     for idx, (team1, team2) in enumerate(matchups, 1):
+        embed.add_field(name='——————————————————————————',
+                        value=f'**Matchup {idx}** (votes: {votes[idx]}) {"☑️ " * votes[idx]}',
+                        inline=False)
         team1_names = '\n'.join([get_display_name(user) for user in team1])
         team2_names = '\n'.join([get_display_name(user) for user in team2])
         embed.add_field(name='Team 1', value=team1_names, inline=True)
         embed.add_field(name='Team 2', value=team2_names, inline=True)
-        embed.add_field(name=f'▲▲▲ Matchup {idx} (votes: {votes[idx]}) ▲▲▲',
-                        value='——————————————————————',
-                        inline=False)
+        #embed.add_field(name=f'▲▲▲ Matchup {idx} (votes: {votes[idx]}) ▲▲▲',
+        #                value='——————————————————————',
+        #                inline=False)
 
     # Clearer re-roll option with votes
-    embed.add_field(name=f'Re-roll Matchups (votes: {reroll_votes})',
-                    value='Vote to re-roll all matchups and generate new ones.', inline=False)
+    embed.add_field(name='——————————————————————————',
+                    value=f'**Re-roll Matchups** (votes: {reroll_votes}) {"🎲 " * reroll_votes}\nVote to re-roll all matchups and generate new ones.', inline=False)
+    #embed.add_field(name=f'Re-roll Matchups (votes: {reroll_votes})',
+    #                value='Vote to re-roll all matchups and generate new ones.', inline=False)
 
     # If the voting message exists, edit it, otherwise send a new one
     if voting_message:
-        await voting_message.edit(embed=embed)
+        if phase != Phase.MATCHUP:
+            await voting_message.edit(embed=embed, view=None)
+        else:
+            await voting_message.edit(embed=embed)
     else:
         voting_message = await channel.send(embed=embed, view=VotingView())
 
@@ -554,7 +593,7 @@ class VotingView(View):
     async def vote_3(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_vote(interaction, 3)
 
-    @discord.ui.button(label='Re-roll', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
+    @discord.ui.button(label='Re-roll 🎲', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
     async def vote_reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_reroll_vote(interaction)
 
@@ -585,13 +624,13 @@ class VotingView(View):
 
         await interaction.response.send_message(f'You voted for Matchup {matchup_number}.', ephemeral=True)
 
-        # Update the voting message
-        await display_matchup_votes(interaction.message.channel)
-
         # Check if any matchup has 5 votes (for 5v5)
         if votes[matchup_number] >= votes_required and not final_matchup_sent:
             final_matchup_sent = True  # Ensure this block runs only once
             await declare_matchup(interaction.message.channel, matchup_number)
+
+        # Update the voting message
+        await display_matchup_votes(interaction.message.channel)
             
 
     async def register_reroll_vote(self, interaction):
@@ -651,33 +690,32 @@ async def declare_matchup(channel, matchup_number):
 
     # Create the new waiting room after final matchup
     await create_waiting_room(channel)
+    await update_queue_message() # single update of queue message for new phase
 
 
 # Create a waiting room for players not in the Final Matchup
 async def create_waiting_room(channel):
    global waiting_room, waiting_room_message
-
-
-   # Populate the waiting room with players not in the final matchup
-   waiting_room = [user for user in queue if user not in final_matchup_players]
-
-
-   embed = discord.Embed(
-       title="Waiting Room",
-       description="Players not in the Current Matchup can join the waiting room.",
-       color=discord.Color.purple()
-   )
-
-
-   waiting_room_names = ', '.join([get_display_name(user) for user in waiting_room]) or 'No players in waiting room.'
-   embed.add_field(name='Players in Waiting Room', value=waiting_room_names, inline=False)
-
-
+   embed = waiting_room_embed()
    if waiting_room_message:
        await waiting_room_message.edit(embed=embed, view=WaitingRoomView())
    else:
        waiting_room_message = await channel.send(embed=embed, view=WaitingRoomView())
 
+# Function to make the waiting room embed
+def waiting_room_embed():
+    waiting_room_names = ', '.join(
+        [get_display_name(user) for user in waiting_room]) or 'No players in waiting room.'
+    embed = discord.Embed(
+        title="PUGs Queue",
+        description="Waiting for match to complete.",
+        color=discord.Color.purple()
+    )
+    embed.add_field(name=f'Waiting Room ({len(waiting_room)})', value=waiting_room_names, inline=False)
+    if re_queue:
+        re_queue_names = ', '.join([get_display_name(user) for user in re_queue])
+        embed.add_field(name=f'Re-Queueing ({len(re_queue)})', value=re_queue_names, inline=False)
+    return embed
 
 # View for the waiting room buttons
 class WaitingRoomView(View):
@@ -685,48 +723,20 @@ class WaitingRoomView(View):
        super().__init__(timeout=None)
 
 
-   @discord.ui.button(label='Join Waiting Room', style=discord.ButtonStyle.green)
+   @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
    async def join_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-       user = interaction.user
-       if len(waiting_room) >= 9:
-           await interaction.response.send_message(
-               'The waiting room is full (10/10 players). Please wait for the next game.', ephemeral=True)
-           return
-       if user in final_matchup_players:
-           await interaction.response.send_message('You are in the current matchup and cannot join the waiting room.',
-                                                   ephemeral=True)
-       elif user in waiting_room:
-           await interaction.response.send_message('You are already in the waiting room.', ephemeral=True)
-       else:
-           waiting_room.append(user)
-           await interaction.response.send_message(f'{user.mention} joined the waiting room.', ephemeral=True)
-           await update_waiting_room_message()
+       await handle_queue_join(interaction)
 
-
-   # New button to leave the waiting room
-   @discord.ui.button(label='Leave Waiting Room', style=discord.ButtonStyle.red)
+   @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
    async def leave_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-       user = interaction.user
-       if user in waiting_room:
-           waiting_room.remove(user)
-           await interaction.response.send_message(f'{user.mention} left the waiting room.', ephemeral=True)
-           await update_waiting_room_message()
-       else:
-           await interaction.response.send_message('You are not in the waiting room.', ephemeral=True)
+       await handle_queue_leave(interaction)
 
 
 # Function to update the waiting room message
 async def update_waiting_room_message():
    global waiting_room_message
    if waiting_room_message:
-       waiting_room_names = ', '.join(
-           [get_display_name(user) for user in waiting_room]) or 'No players in waiting room.'
-       embed = discord.Embed(
-           title="Waiting Room",
-           description="Players not in the Current Matchup can join the waiting room.",
-           color=discord.Color.purple()
-       )
-       embed.add_field(name='Players in Waiting Room', value=waiting_room_names, inline=False)
+       embed = waiting_room_embed()
        await waiting_room_message.edit(embed=embed, view=WaitingRoomView())
 
 
@@ -736,7 +746,7 @@ class ResetQueueView(View):
        super().__init__(timeout=None)
 
 
-   @discord.ui.button(label='Vote to Reset Queue', style=discord.ButtonStyle.danger)
+   @discord.ui.button(label='Match Complete', style=discord.ButtonStyle.danger)
    async def reset_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
        await self.register_reset_vote(interaction)
 
@@ -745,14 +755,14 @@ class ResetQueueView(View):
        global reset_queue_votes, reset_voted_users, reset_in_progress
        user = interaction.user
        if user in reset_voted_users:
-           await interaction.response.send_message('You have already voted to reset the queue.', ephemeral=True)
+           await interaction.response.send_message('You have already marked the match as complete.', ephemeral=True)
            return
 
 
        # Only allow Final Matchup players to reset the queue
        if user not in final_matchup_players:
            await interaction.response.send_message(
-               'You are not in the Current Matchup and cannot vote to reset the queue.', ephemeral=True)
+               'You are not in the Current Matchup and cannot mark the match as complete.', ephemeral=True)
            return
 
 
@@ -764,19 +774,19 @@ class ResetQueueView(View):
        reset_queue_votes += 1
        reset_voted_users.add(user)
        await interaction.response.send_message(
-           f'{user.mention} voted to reset the queue ({reset_queue_votes}/{reset_queue_votes_required} votes).',
+           f'{user.mention} marked the match as complete ({reset_queue_votes}/{reset_queue_votes_required} votes).',
            ephemeral=True)
 
 
        # Display votes and check if the required number of votes have been reached
        if reset_queue_votes >= reset_queue_votes_required and not reset_in_progress:
            reset_in_progress = True  # Prevent multiple resets
-           await interaction.message.channel.send('Queue has been reset by vote.')
+           await interaction.message.channel.send('Match marked as complete by vote.  Resetting queue...')
            await self.remove_buttons(interaction)  # Remove buttons after reset
-           await self.restart_queue(interaction.message.channel)  # Reset the queue and send a new queue message
+           await restart_queue(interaction.message.channel)  # Reset the queue and send a new queue message
        elif not reset_in_progress:
            await interaction.message.channel.send(
-               f'Reset queue votes: {reset_queue_votes}/{reset_queue_votes_required}.')
+               f'Match complete votes: {reset_queue_votes}/{reset_queue_votes_required}.')
 
 
    async def remove_buttons(self, interaction):
@@ -785,25 +795,27 @@ class ResetQueueView(View):
            child.disabled = True
        await interaction.message.edit(view=None)  # Edit the message to remove buttons
 
-
-   async def restart_queue(self, channel):
-       reset_game()  # Reset the game state first
-       await add_waiting_room_to_queue(channel)  # Now add waiting room players to the empty queue
-       await remove_old_queue_message()  # Remove the old queue message
-       await start_new_queue(channel)  # Start a new queue with waiting room players
+# restart queue after match is complete
+async def restart_queue(channel):
+    global phase
+    phase = Phase.RESET
+    await update_queue_message()  # final update of old queue message
+    # reset queue state
+    reset_game()
+    await add_waiting_room_players_to_queue(channel)  # Now add waiting room players to the empty queue
+    await remove_old_queue_message()  # Remove the old queue message
+    await start_new_queue(channel)  # Start a new queue with waiting room players
 
 
 # Add waiting room players to the new queue
-async def add_waiting_room_to_queue(channel):
+async def add_waiting_room_players_to_queue(channel):
    global waiting_room, queue
-
-
-   queue[:] = waiting_room  # Move waiting room players to queue
-   waiting_room.clear()  # Clear the waiting room
-
-
-   if queue_message:
-       await update_queue_message()  # Update the queue message
+   # Move all players from requeue into waiting room
+   waiting_room.extend(re_queue)
+   re_queue.clear()
+   # Move players out of the waiting room until queue is full or waiting room is empty
+   queue[:] = waiting_room[:queue_size_required]  
+   waiting_room[:] = waiting_room[queue_size_required:]
 
 
 # Start a new queue programmatically without needing the command context
@@ -822,6 +834,9 @@ async def start_new_queue(channel):
        except discord.NotFound:
            print("Waiting room message was already deleted.")
        waiting_room_message = None
+   
+   # check if queue is full
+   await check_full_queue()
 
 
 # Function to remove the old queue message
@@ -939,6 +954,7 @@ async def s0(ctx):
     await ctx.send(syco_commands_msg(7780))
 
 # Command to manually add users to the queue
+# Todo: add users to waitlist if queue fills up or a game is in progress
 @bot.command(name='queue_users')
 async def queue_users(ctx, members: commands.Greedy[discord.Member]):
     if not game_in_progress and queue_message:
