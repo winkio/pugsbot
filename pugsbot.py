@@ -261,8 +261,8 @@ class PugMatch():  # holds data for a single pug match
         # if team size is greater than 2, avoid rerolling a team from the last set of matchups
         if team_size > 2 and self.matchups:
             for team1, team2 in self.matchups:
-                team1_ids = ' '.join([str(user.id) for user in self.team1])
-                team2_ids = ' '.join([str(user.id) for user in self.team2])
+                team1_ids = ' '.join([str(user.id) for user in team1])
+                team2_ids = ' '.join([str(user.id) for user in team2])
                 unique_team_ids.add(team1_ids)
                 unique_team_ids.add(team2_ids)
                 
@@ -1436,13 +1436,13 @@ async def fill_cmd(ctx, members: commands.Greedy[discord.Member]):
     if len(in_players) != 1 or len(out_players) != 1:
         await ctx.send(f'Must fill a player in the match with one not in the match.')
         return
-    p_in = in_players[0]
-    p_out = out_players[0]
+    p_in = in_players[0]  # player in match
+    p_out = out_players[0]  # player not in match
     await current_match.replace_player(p_in, p_out, ctx.message.channel)
-    if p_out in queue:
-        replace_list_item(queue, p_out, p_in)
-    if p_in in waiting_room:
-        waiting_room.remove(p_in)
+    if p_in in queue:
+        replace_list_item(queue, p_in, p_out)
+    if p_out in waiting_room:
+        waiting_room.remove(p_out)
     await ctx.send(f'{get_display_name(p_out)} is filling in for {get_display_name(p_in)}.')
     if phase >= Phase.PLAY:
         await update_waiting_room_message()
