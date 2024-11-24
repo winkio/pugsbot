@@ -1159,7 +1159,8 @@ async def restart_queue(channel):
 def add_waiting_room_players_to_queue():
     global queue, waiting_room
     if current_match: # Move all players from requeue into waiting room
-        waiting_room.extend(current_match.re_queue)
+        non_duplicates = [user for user in current_match.re_queue if user not in waiting_room]
+        waiting_room.extend(non_duplicates)
     # Move players out of the waiting room until queue is full or waiting room is empty
     queue[:] = waiting_room[:queue_size_required]  
     waiting_room[:] = waiting_room[queue_size_required:]
