@@ -126,6 +126,10 @@ def reset_game():
 # Helper function to get a user's preferred display name
 def get_display_name(user):
     return user.nick or user.display_name or user.name
+    
+# Helper function to get a case insensitve key to sort users
+def user_sort_key(user):
+    return str.casefold(get_display_name(user))
 
 # Function to make the queue embed
 def queue_embed():
@@ -194,6 +198,11 @@ async def update_queue_message():
             queue_message = await bot.get_channel(queue_message.channel.id).send(embed=embed, view=QueueView())
 
     # If we have the required number of players, move to ready check
+    await check_full_queue()
+
+# Function that checks if we have the required number of players, and if so moves to ready check
+async def check_full_queue():
+    global game_in_progress
     if len(queue) == queue_size_required and not game_in_progress:
         game_in_progress = True
         await start_ready_check(queue_message.channel)
@@ -325,22 +334,22 @@ class ReadyUpView(View):
         else:
             await interaction.response.send_message('You are not in the queue or already ready.', ephemeral=True)
             
-    @discord.ui.button(label='Bail Out', style=discord.ButtonStyle.red)
-    async def decline_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        global game_in_progress
-        user = interaction.user
-        if user in queue:
-            if user in ready_players:
-                interaction.response.send_message('Cannot decline queue after clicking ready.', ephemeral=True)
-            elif user in decline_ready_players:
-                if game_in_progress:
-                    game_in_progress = False
-                    await decline_and_requeue(user, interaction.message.channel)
-            else:
-                decline_ready_players.add(user)
-                await interaction.response.send_message('Are you sure you want to bail out?  Click again to confirm.', ephemeral=True)
-        else:
-            await interaction.response.send_message('You are not in the queue.', ephemeral=True)
+#    @discord.ui.button(label='Bail Out', style=discord.ButtonStyle.red)
+#    async def decline_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+#        global game_in_progress
+#        user = interaction.user
+#        if user in queue:
+#            if user in ready_players:
+#                interaction.response.send_message('Cannot decline queue after clicking ready.', ephemeral=True)
+#            elif user in decline_ready_players:
+#                if game_in_progress:
+#                    game_in_progress = False
+#                    await decline_and_requeue(user, interaction.message.channel)
+#            else:
+#                decline_ready_players.add(user)
+#                await interaction.response.send_message('Are you sure you want to bail out?  Click again to confirm.', ephemeral=True)
+#        else:
+#            await interaction.response.send_message('You are not in the queue.', ephemeral=True)
 
 # New function to decline ready and go back to queue
 async def decline_and_requeue(user, channel):
@@ -351,7 +360,7 @@ async def decline_and_requeue(user, channel):
         ready_up_task.cancel()
         ready_up_task = None
         
-    await channel.send(f"{user} declined the queue. Re-queuing {len(queue) - 1} other players.")
+    await channel.send(f"{get_display_name(user)} declined the queue. Re-queuing {len(queue) - 1} other players.")
     await remove_ready_message()  # Remove the ready check message and buttons
     queue.remove(user)    # Remove the player who declined from the queue
     ready_players.clear()  # Clear the ready players set for the next ready check
@@ -469,20 +478,29 @@ async def declare_selected_map(channel, selected_map):
 async def proceed_to_matchups_phase(channel):
     global phase, matchups, votes, voted_users, voting_message
     phase = Phase.MATCHUP
+    team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
     players = list(ready_players)
-    matchups = []
     unique_team_ids = set()
+    # if team size is greater than 2, avoid rerolling a team from the last set of matchups
+    if team_size > 2 and matchups:
+        for team1, team2 in matchups:
+            team1_ids = ' '.join([str(user.id) for user in team1])
+            team2_ids = ' '.join([str(user.id) for user in team2])
+            unique_team_ids.add(team1_ids)
+            unique_team_ids.add(team2_ids)
+            
+    # clear old matchups and votes
+    matchups = []
     votes.clear()  # Clear votes only at the start of new matchups
     voted_users.clear()  # Reset users who voted
-    team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
 
     # Generate matchups for 5v5
     while len(matchups) < 3:
         random.shuffle(players)
         team1 = players[:team_size]  # 5 players on team 1
         team2 = players[team_size:]  # 5 players on team 2
-        team1.sort(key=get_display_name)
-        team2.sort(key=get_display_name)
+        team1.sort(key=user_sort_key)
+        team2.sort(key=user_sort_key)
         team1_ids = ' '.join([str(user.id) for user in team1])
         team2_ids = ' '.join([str(user.id) for user in team2])
         # check to make sure that generated matchup is unique before adding it
@@ -896,9 +914,7 @@ async def start_pug(ctx):
       embed = queue_embed()
       queue_message = await ctx.send(embed=embed, view=QueueView())
       # If we have the required number of players, move to ready check
-      if len(queue) == queue_size_required and not game_in_progress:
-          game_in_progress = True
-          await start_ready_check(queue_message.channel)
+      await check_full_queue()
    else:
        await ctx.send('A game is already in progress or the queue is active.')
 
@@ -921,7 +937,7 @@ async def s9(ctx):
 @bot.command(name='s0')
 async def s0(ctx):
     await ctx.send(syco_commands_msg(7780))
-    
+
 # Command to manually add users to the queue
 @bot.command(name='queue_users')
 async def queue_users(ctx, members: commands.Greedy[discord.Member]):
