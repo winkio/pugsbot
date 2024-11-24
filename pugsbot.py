@@ -2,6 +2,7 @@ import os
 import random
 import asyncio
 from collections import defaultdict
+from enum import Enum
 
 import discord
 from discord.ext import commands
@@ -26,10 +27,21 @@ async def on_ready():
     await bot.change_presence(status=discord.Status.online, activity=activity)
     print(f'Logged in as {bot.user.name}')
 
+# Phase enum
+class Phase(Enum):
+    NONE = 1
+    QUEUE = 2
+    READY = 3
+    MAP = 4
+    MATCHUP = 5
+    PLAY = 6
+    
 # Global variables to keep track of the queue and game states
+phase = Phase.QUEUE
 queue = []
 waiting_room = []
 ready_players = set()
+decline_ready_players = set()
 matchups = []
 votes = defaultdict(int)
 voted_users = {}  # Track individual votes for changeable votes
@@ -48,23 +60,29 @@ final_matchup_players = set()  # Players in the final matchup
 
 # New global variables for map voting
 map_votes = defaultdict(int)
-map_voted_users = set()
+map_voted_users = {}  # Track individual votes for changeable votes
 map_voting_message = None  # To store the map voting message
 selected_map = None  # To store the selected map
+selected_map_sent = False # Track if the selected map has already been sent
 
 # Constants for settings
+map_choices = ["Ghost Reef 🏜️", "Sirens Strand 🧊", "Sanctum Falls 🌊", "Ember Grove 🌲", "Sky City ☁️"]
 ready_up_time = 90  # Set the ready-up time to 90 seconds
 queue_size_required = 10  # 10 players required for 5v5
 reset_queue_votes_required = 4  # Require 4 votes to reset the queue
-votes_required = 5  # Require 5 votes to pick matchups or re-roll
+votes_required = 5  # Require 5 votes to pick maps, matchups, or re-roll
+map_total_votes_required = 7  # Require 7 total votes to choose a map
+queue_file_path = 'stored_queue.txt'
 
 # Helper function to reset the game state but keep the waiting room intact
 def reset_game():
-    global queue, ready_players, matchups, votes, voted_users, reroll_votes, reset_queue_votes, reset_voted_users
+    global phase, queue, ready_players, decline_ready_players, matchups, votes, voted_users, reroll_votes, reset_queue_votes, reset_voted_users
     global game_in_progress, queue_message, voting_message, final_matchup_sent, ready_message, ready_up_task, reset_in_progress, final_matchup_players
-    global map_votes, map_voted_users, map_voting_message, selected_map
+    global map_votes, map_voted_users, map_voting_message, selected_map, selected_map_sent
+    phase = Phase.QUEUE
     queue = []
     ready_players = set()
+    decline_ready_players = set()
     matchups = []
     votes = defaultdict(int)
     voted_users = {}  # Reset individual vote tracking
@@ -75,13 +93,15 @@ def reset_game():
     queue_message = None
     voting_message = None
     ready_message = None
+    
     final_matchup_sent = False
     final_matchup_players = set()
     reset_in_progress = False  # Reset the flag
     map_votes = defaultdict(int)
-    map_voted_users = set()
+    map_voted_users = {}
     map_voting_message = None
     selected_map = None
+    selected_map_sent = False
 
     # Cancel the countdown task if it's running
     if ready_up_task is not None:
@@ -99,6 +119,11 @@ class QueueView(View):
 
     @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
     async def join_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # do nothing if no longer in queue phase
+        if phase != Phase.QUEUE:
+            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+            return
+            
         user = interaction.user
         if len(queue) >= queue_size_required:
             await interaction.response.send_message(f'{user.mention}, the queue is full!', ephemeral=True)
@@ -115,6 +140,11 @@ class QueueView(View):
 
     @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # do nothing if no longer in queue phase
+        if phase != Phase.QUEUE:
+            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+            return
+        
         user = interaction.user
         if user in queue:
             queue.remove(user)
@@ -148,8 +178,10 @@ async def update_queue_message():
 
 # Function to start the ready check
 async def start_ready_check(channel):
-    global ready_players, ready_up_task
+    global phase, ready_players, decline_ready_players, ready_up_task
+    phase = Phase.READY
     ready_players = set()
+    decline_ready_players = set()
 
     # Gather all player mentions
     mentions = ' '.join([user.mention for user in queue])
@@ -263,6 +295,8 @@ class ReadyUpView(View):
     async def ready_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         user = interaction.user
         if user in queue and user not in ready_players:
+            if user in decline_ready_players:
+                decline_ready_players.remove(user)
             ready_players.add(user)
             await interaction.response.send_message(f'{user.mention} is ready!', ephemeral=True)
             await update_ready_up_message(time_left=ready_up_time)  # Update the ready-up message with new players
@@ -271,10 +305,45 @@ class ReadyUpView(View):
                 await proceed_to_map_voting(interaction.message.channel)
         else:
             await interaction.response.send_message('You are not in the queue or already ready.', ephemeral=True)
+            
+    @discord.ui.button(label='Decline Queue', style=discord.ButtonStyle.red)
+    async def decline_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        global game_in_progress
+        user = interaction.user
+        if user in queue:
+            if user in ready_players:
+                await interaction.response.send_message('Cannot decline queue after clicking ready.', ephemeral=True)
+            elif user in decline_ready_players:
+                if game_in_progress:
+                    game_in_progress = False
+                    await decline_and_requeue(user, interaction.message.channel)
+            else:
+                decline_ready_players.add(user)
+                await interaction.response.send_message('Are you sure you want to decline the queue?  Click again to confirm.', ephemeral=True)
+        else:
+            await interaction.response.send_message('You are not in the queue.', ephemeral=True)
+
+# New function to decline ready and go back to queue
+async def decline_and_requeue(user, channel):
+    global phase, ready_up_task
+    phase = Phase.READY
+    # Cancel the ready-up task to prevent it from running after this point
+    if ready_up_task is not None:
+        ready_up_task.cancel()
+        ready_up_task = None
+        
+    await channel.send(f"{user} declined the queue. Re-queuing {len(queue) - 1} other players.")
+    await remove_ready_message()  # Remove the ready check message and buttons
+    queue.remove(user)    # Remove the player who declined from the queue
+    ready_players.clear()  # Clear the ready players set for the next ready check
+    decline_ready_players.clear()  # Clear the unconfirmed declined players set for the next ready check
+    await remove_old_queue_message()  # Remove the old queue message
+    await start_new_queue(channel)  # Post a new queue message with ready players
 
 # New function to proceed to map voting
 async def proceed_to_map_voting(channel):
-    global map_votes, map_voted_users, map_voting_message, ready_up_task
+    global phase, map_votes, map_voted_users, map_voting_message, ready_up_task
+    phase = Phase.MAP
     # Cancel the ready-up task to prevent it from running after this point
     if ready_up_task is not None:
         ready_up_task.cancel()
@@ -282,12 +351,9 @@ async def proceed_to_map_voting(channel):
 
     await remove_ready_message()  # Remove the ready check message and buttons
 
-    map_votes = defaultdict(int)
-    map_voted_users = set()
+    map_votes.clear()  # Clear votes only at the start of new matchups
+    map_voted_users.clear()  # Reset users who voted
     map_voting_message = None
-
-    # List of maps
-    map_choices = ["Ghost Reef 🪸", "Sirens Strand 🧊", "Sanctum Falls 🌊", "Ember Grove 🌲", "Sky City ☁️"]
 
     # Create the embed message
     embed = discord.Embed(title='Map Voting', description='Vote for the map you want to play on.', color=discord.Color.green())
@@ -295,13 +361,12 @@ async def proceed_to_map_voting(channel):
         embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=False)
 
     # Send the message with the MapVotingView
-    map_voting_message = await channel.send(embed=embed, view=MapVotingView(map_choices))
+    map_voting_message = await channel.send(embed=embed, view=MapVotingView())
 
 # Class for map voting
 class MapVotingView(View):
-    def __init__(self, map_choices):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.map_choices = map_choices
         for map_name in map_choices:
             button = Button(label=map_name, style=discord.ButtonStyle.primary, custom_id=map_name)
             button.callback = self.make_callback(map_name)
@@ -313,38 +378,55 @@ class MapVotingView(View):
         return callback
 
     async def register_map_vote(self, interaction, map_name):
-        global map_votes, map_voted_users, selected_map
+        global map_votes, map_voted_users, selected_map, selected_map_sent
+        # do nothing if no longer in map voting phase
+        if phase != Phase.MAP:
+            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+            return
+        
         user = interaction.user
 
         if user not in ready_players:
             await interaction.response.send_message('You are not part of the game.', ephemeral=True)
             return
 
+        # Allow user to change their vote
         if user in map_voted_users:
-            await interaction.response.send_message('You have already voted for a map.', ephemeral=True)
-            return
+            map_previous_vote = map_voted_users[user]
+            if map_previous_vote == "map_name":
+                await interaction.response.send_message(f'You have already voted for {map_name}.', ephemeral=True)
+                return
+            else:
+                map_votes[map_previous_vote] -= 1  # Remove their previous map vote
 
         map_votes[map_name] += 1
-        map_voted_users.add(user)
+        map_voted_users[user] = map_name
         await interaction.response.send_message(f'You voted for {map_name}.', ephemeral=True)
 
         # Update the voting message
         await update_map_voting_message()
 
-        # Check if 6 votes have been cast
-        if len(map_voted_users) >= 6:
+        # Check if the map has 5 votes (for 5v5)
+        if (map_votes[map_name] >= votes_required) and not selected_map_sent:
+            selected_map_sent = True
+            selected_map = map_name
+            await declare_selected_map(interaction.message.channel, selected_map)
+        # Check if 7 votes have been cast
+        elif len(map_voted_users) >= map_total_votes_required and not selected_map_sent:
+            selected_map_sent = True
             # Determine the map(s) with the most votes (in case of tie)
             max_votes = max(map_votes.values())
             top_maps = [name for name, count in map_votes.items() if count == max_votes]
             selected_map = random.choice(top_maps)  # If tie, select randomly among top maps
             await declare_selected_map(interaction.message.channel, selected_map)
+            
 
 # Function to update the map voting message
 async def update_map_voting_message():
     global map_voting_message
     if map_voting_message:
         embed = discord.Embed(title='Map Voting', description='Vote for the map you want to play on.', color=discord.Color.green())
-        for map_name in ["Ghost Reef", "Sirens Strand", "Sanctum Falls", "Ember Grove", "Sky City"]:
+        for map_name in map_choices:
             embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=False)
         await map_voting_message.edit(embed=embed)
 
@@ -352,11 +434,12 @@ async def update_map_voting_message():
 async def declare_selected_map(channel, selected_map):
     await channel.send(f"The selected map is **{selected_map}**!")
     # Proceed to matchup voting
-    await proceed_to_matchups_phase(channel)
+    await proceed_to_matchups_phase(channel)   
 
 # Adjusted function to proceed to matchups
 async def proceed_to_matchups_phase(channel):
-    global matchups, votes, voted_users, voting_message
+    global phase, matchups, votes, voted_users, voting_message
+    phase = Phase.MATCHUP
     players = list(ready_players)
     matchups = []
     votes.clear()  # Clear votes only at the start of new matchups
@@ -367,6 +450,8 @@ async def proceed_to_matchups_phase(channel):
         random.shuffle(players)
         team1 = players[:5]  # 5 players on team 1
         team2 = players[5:]  # 5 players on team 2
+        team1.sort(key=get_display_name)
+        team2.sort(key=get_display_name)
         matchups.append((team1.copy(), team2.copy()))
 
     # Display the matchups
@@ -375,19 +460,22 @@ async def proceed_to_matchups_phase(channel):
 # Function to display the voting embed with votes count and enhanced readability
 async def display_matchup_votes(channel):
     global reroll_votes, voting_message
-    embed = discord.Embed(title='Matchup Voting', description='Vote for your preferred matchup or vote to re-roll.',
+    embed = discord.Embed(title='Matchup Voting', description='Vote for your preferred matchup or vote to re-roll.\n——————————————————————',
                           color=discord.Color.green())
 
     for idx, (team1, team2) in enumerate(matchups, 1):
         team1_names = '\n'.join([get_display_name(user) for user in team1])
         team2_names = '\n'.join([get_display_name(user) for user in team2])
+        embed.add_field(name='Team 1', value=team1_names, inline=True)
+        embed.add_field(name='Team 2', value=team2_names, inline=True)
         embed.add_field(name=f'Matchup {idx} ({votes[idx]} votes)',
-                        value=f'**Team 1:**\n{team1_names}\n\n**Team 2:**\n{team2_names}\n\n----------------------------------',
+                        value='——————————————————————',
                         inline=False)
 
     # Clearer re-roll option with votes
     embed.add_field(name=f'Re-roll Matchups ({reroll_votes} votes)',
-                    value='Vote to re-roll all matchups and generate new ones.', inline=False)
+                    value='Vote to re-roll all matchups and generate new ones.', 
+                    inline=False)
 
     # If the voting message exists, edit it, otherwise send a new one
     if voting_message:
@@ -418,6 +506,11 @@ class VotingView(View):
 
     async def register_vote(self, interaction, matchup_number):
         global final_matchup_sent  # To ensure the final matchup is only sent once
+        # do nothing if no longer in team voting phase
+        if phase != Phase.MATCHUP:
+            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+            return
+        
         user = interaction.user
 
         if user not in ready_players:
@@ -447,6 +540,11 @@ class VotingView(View):
 
     async def register_reroll_vote(self, interaction):
         global reroll_votes, votes, voted_users
+        # do nothing if no longer in team voting phase
+        if phase != Phase.MATCHUP:
+            await interaction.response.send_message('This button is no longer active.', ephemeral=True)
+            return
+        
         user = interaction.user
 
         if user not in ready_players:
@@ -479,17 +577,18 @@ class VotingView(View):
 
 # Function to declare the chosen matchup
 async def declare_matchup(channel, matchup_number):
-    global waiting_room_message, final_matchup_players
+    global phase, waiting_room_message, final_matchup_players
 
+    phase = Phase.PLAY
     team1, team2 = matchups[matchup_number - 1]
     final_matchup_players = set(team1 + team2)  # Mark players in Final Matchup
     team1_names = ', '.join([get_display_name(user) for user in team1])
     team2_names = ', '.join([get_display_name(user) for user in team2])
 
     embed = discord.Embed(title='Final Matchup', color=discord.Color.gold())
+    embed.add_field(name='Map', value=selected_map, inline=False)
     embed.add_field(name='Team 1', value=team1_names, inline=False)
     embed.add_field(name='Team 2', value=team2_names, inline=False)
-    embed.add_field(name='Selected Map', value=selected_map, inline=False)
     embed.set_footer(text='Good luck and have fun!')
 
     await channel.send(embed=embed, view=ResetQueueView())
@@ -614,12 +713,12 @@ class ResetQueueView(View):
 
 
        # Display votes and check if the required number of votes have been reached
-       if reset_queue_votes >= reset_queue_votes_required:
+       if reset_queue_votes >= reset_queue_votes_required and not reset_in_progress:
            reset_in_progress = True  # Prevent multiple resets
            await interaction.message.channel.send('Queue has been reset by vote.')
            await self.remove_buttons(interaction)  # Remove buttons after reset
            await self.restart_queue(interaction.message.channel)  # Reset the queue and send a new queue message
-       else:
+       elif not reset_in_progress:
            await interaction.message.channel.send(
                f'Reset queue votes: {reset_queue_votes}/{reset_queue_votes_required}.')
 
@@ -653,7 +752,8 @@ async def add_waiting_room_to_queue(channel):
 
 # Start a new queue programmatically without needing the command context
 async def start_new_queue(channel):
-   global queue_message, waiting_room_message
+   global phase, queue_message, waiting_room_message
+   phase = Phase.QUEUE
    # Send a completely new queue message instead of editing the old one
    queue_names = ', '.join([get_display_name(user) for user in queue]) or 'No players in queue.'
    embed = discord.Embed(title='PUGs Queue',
@@ -712,13 +812,69 @@ async def end_pug(ctx):
 # Command to start the PUG system
 @bot.command(name='start_pug')
 async def start_pug(ctx):
-   global queue_message
+   global phase, queue_message
    if not game_in_progress and not queue:
+       phase = Phase.QUEUE
        queue_message = await ctx.send(
            embed=discord.Embed(title="PUGs Queue", description="No players in queue.", color=discord.Color.blue()),
            view=QueueView())
    else:
        await ctx.send('A game is already in progress or the queue is active.')
+       
+# Command to start the PUG system in the gig esports #pugs-queue channel
+@bot.command(name='start_pug_gigesports')
+async def start_pug(ctx):
+   global phase, queue_message
+   if not game_in_progress and not queue:
+       phase = Phase.QUEUE
+       queue_channel = ctx.guild.get_channel(1293818329118539847)
+       queue_message = await queue_channel.send(
+           embed=discord.Embed(title="PUGs Queue", description="No players in queue.", color=discord.Color.blue()),
+           view=QueueView())
+   else:
+       await ctx.send('A game is already in progress or the queue is active.')
+       
+# Command to manually add users to the queue
+@bot.command(name='queue_users')
+async def queue_users(ctx, members: commands.Greedy[discord.Member], *):
+    if not game_in_progress and queue:
+        for member in members:
+            queue.add(member.user)
+      await ctx.send(f'Added {len(members)} players to queue.')
+    else:
+      await ctx.send('Cannot queue players, a game is already in progress.')
+      
+# Command to store the current queue to a file
+@bot.command(name='store_queue')
+async def store_queue(ctx):
+   if not game_in_progress and queue:
+      with open(queue_file_path, 'w') as queue_file:
+         queue_file.write('\n'.join(str(user.id) for user in queue))
+      await ctx.send(f'Queue stored with {len(queue)} players.')
+   else:
+      await ctx.send('Cannot store queue, a game is already in progress.')
+      
+# Command to restore the saved queue from a file
+@bot.command(name='restore_queue')
+async def restore_queue(ctx):
+   global queue
+   if not game_in_progress:
+      if os.path.isfile(queue_file_path):
+          queue = []
+          with open(queue_file_path, 'r') as queue_file:
+              for id_line in queue_file:
+                try:
+                    user_id = int(id_line.strip())
+                    user = await ctx.bot.fetch_user(user_id)
+                    queue.add(user)
+                except ValueError:
+                    
+          os.remove(queue_file_path)
+          await ctx.send(f'Queue restored with {len(queue)} players.')
+      else:
+          await ctx.send('No saved queue found.')
+   else:
+      await ctx.send('Cannot restore queue, a game is already in progress.')
 
 
 # Run the bot
