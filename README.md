@@ -1,8 +1,8 @@
 # pugsbot
-Discord bot for managing Gigantic PUGs, written in python. Original author: Dave (aka IlluzDave, slothluck)
+Discord bot for managing Gigantic PUGs, written in python. Original author: IluZDave
 
 # config
-Requires a file name '.env' in the same folder with the data:
+Requires a file named '.env' in the same folder with the data:
 DISCORD_TOKEN=____the token for the bot____
 
 ## discord bot config
