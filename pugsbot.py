@@ -38,6 +38,7 @@ async def on_ready():
 map_choices = ["Ghost Reef 🏜️", "Sirens Strand 🧊", "Sanctum Falls 🌊", "Ember Grove 🌲", "Sky City ☁️"]
 ready_up_time = 90  # Set the ready-up time to 90 seconds
 queue_size_required = 10  # 10 players required for 5v5
+team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
 reset_queue_votes_required = 4  # Require 4 votes to reset the queue
 votes_required = 5  # Require 5 votes to pick maps, matchups, or re-roll
 map_total_votes_required = 7  # Require 7 total votes to choose a map
@@ -64,6 +65,7 @@ re_queue = []  # Players re-queueing after current match
 game_in_progress = False
 queue_message = None
 
+queue_sorted = []
 ready_players = set()
 bailouts_unc = []  # Players who have clicked bailout once but not confirmed
 bailouts = []  # Players who are bailing out
@@ -82,9 +84,12 @@ selected_map_sent = False # Track if the selected map has already been sent
 map_voting_message = None  # To store the map voting message
 
 matchups = []
+custom_team1 = []  # custom team 1 users
+custom_team2 = []  # custom team 2 users
 votes = defaultdict(int)
 voted_users = {}  # Track individual votes for changeable votes
-reroll_votes = 0
+reroll_key = 'reroll'  # key for reroll votes in votes dict
+custom_teams_key = 'custom'  # key for custom votes in votes dict
 final_matchup_sent = False  # Track if the final matchup has already been sent
 voting_message = None
 
@@ -100,9 +105,9 @@ waiting_room_message = None  # For the waiting room message
 # Helper function to reset the game state but keep the waiting room intact
 def reset_game():
     global phase, queue, game_in_progress, queue_message
-    global ready_players, bailouts_unc, bailouts, standby, ready_start, ready_end, ready_up_timed_out, all_ready_sent, ready_message, ready_up_task
+    global queue_sorted, ready_players, bailouts_unc, bailouts, standby, ready_start, ready_end, ready_up_timed_out, all_ready_sent, ready_message, ready_up_task
     global map_votes, map_voted_users, selected_map, selected_map_sent, map_voting_message
-    global matchups, votes, voted_users, reroll_votes, final_matchup_sent, voting_message
+    global matchups, custom_team1, custom_team2, votes, voted_users, final_matchup_sent, voting_message
     global final_matchup_players, final_team1_names, final_team2_names, reset_queue_votes, reset_voted_users, reset_in_progress
     phase = Phase.QUEUE
     queue = []
@@ -111,6 +116,7 @@ def reset_game():
     game_in_progress = False
     queue_message = None
     
+    queue_sorted = []
     ready_players = set()
     bailouts_unc = []
     bailouts = []
@@ -131,9 +137,12 @@ def reset_game():
     map_voting_message = None
     
     matchups = []
+    custom_team1 = []
+    custom_team2 = []
     votes = defaultdict(int)
     voted_users = {}
-    reroll_votes = 0
+    #reroll_key does not change
+    #custom_teams_key does not change
     final_matchup_sent = False
     voting_message = None
     
@@ -242,6 +251,12 @@ async def handle_queue_leave(interaction: discord.Interaction):
     else:
         await update_queue_message()
 
+# Function to get the total number of players in queue + waiting room
+def total_queue_size():
+    if phase >= Phase.PLAY:
+        return len(waiting_room) + len(re_queue)
+    return len(queue) + len(waiting_room)
+
 # Function to update the queue message (editing the original message)
 async def update_queue_message():
     global queue_message
@@ -268,7 +283,7 @@ async def check_full_queue():
 
 # Function to start the ready check
 async def start_ready_check(channel):
-    global phase, ready_players, bailouts_unc, bailouts, standby, ready_start, ready_end, ready_up_task
+    global phase, queue_sorted, ready_players, bailouts_unc, bailouts, standby, ready_start, ready_end, ready_up_task
     phase = Phase.READY
     ready_players = set()
     bailouts_unc = []
@@ -298,6 +313,10 @@ async def start_ready_check(channel):
         except discord.Forbidden:
             print(f"Could not DM {user} due to privacy settings.")
 
+    # create sorted queue
+    queue_sorted = list(queue)
+    queue_sorted.sort(key=user_sort_key)
+
     # Get start and end times
     ready_start = int(time.time())
     ready_end = ready_start + ready_up_time
@@ -316,7 +335,7 @@ async def display_ready_up(channel):
 
     # Send the ready-up message and store its reference
     if ready_message:
-        await ready_message.edit(embed=embed, view=ReadyUpView())
+        await ready_message.edit(embed=embed)
     else:
         ready_message = await channel.send(embed=embed, view=ReadyUpView())
 
@@ -378,13 +397,17 @@ async def end_ready_up(channel):
     queue_message = await remove_message(queue_message)
     await start_new_queue(channel)  # Post a new queue message with ready players
 
+# gets a string with the queue icon and display name of a user in the queue
+def queue_icon_name(user):
+    if user in ready_players:
+        return f'✅ {get_display_name(user)}'
+    if user in bailouts:
+        return f'❌ {get_display_name(user)}'
+    return f'⌛ {get_display_name(user)}'
+
 # Function to make the ready up embed
 def ready_up_embed():
-    queue_sorted = list(queue)
-    queue_sorted.sort(key=user_sort_key)
-    queue_names = '\n'.join([f'✅ {get_display_name(user)}' if user in ready_players else 
-                             f'❌ {get_display_name(user)}' if user in bailouts else
-                             f'⌛ {get_display_name(user)}' for user in queue_sorted])
+    queue_names = '\n'.join([queue_icon_name(user) for user in queue_sorted])
 
     embed = discord.Embed(title='Match Found!',
                           description='Please ready up!  Players in the waiting room can standby to fill.',
@@ -401,16 +424,16 @@ class ReadyUpView(View):
     def __init__(self):
         super().__init__(timeout=None)  # No timeout here, handled by countdown
 
-    @discord.ui.button(label='Ready Up', style=discord.ButtonStyle.green)
+    @discord.ui.button(label='Ready Up / Standby', style=discord.ButtonStyle.green)
     async def ready_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         global standby, all_ready_sent
         user = interaction.user
         if user in queue:
             if user in ready_players:
-                await interaction.response.send_message('Cannot ready after clicking bail out.', ephemeral=True, delete_after=msg_fade1)
+                await interaction.response.send_message('You are already ready.', ephemeral=True, delete_after=msg_fade1)
                 return
             if user in bailouts:
-                await interaction.response.send_message('You are already bailing out.', ephemeral=True, delete_after=msg_fade1)
+                await interaction.response.send_message('Cannot ready after clicking bail out.', ephemeral=True, delete_after=msg_fade1)
                 return
             
             if user in bailouts_unc:
@@ -453,9 +476,15 @@ class ReadyUpView(View):
 
 # checks if enough players have readied for the queue to go through
 async def check_ready_complete(channel):
-    # if all users in match have readied or bailed
-    if (len(ready_players) + len(bailouts) == queue_size_required and
-        len(standby) >= queue_size_required - len(ready_players)):
+    num_non_ready = queue_size_required - len(ready_players)
+    if num_non_ready == 0:  # if all users are ready
+        await end_ready_up(channel)
+        return
+    # if all non-ready are bailing out, make sure that there are enough
+    # players on standby and that they are all at the top of the waiting room
+    if (num_non_ready == len(bailouts) and
+        len(standby) >= num_non_ready and
+        standby[:num_non_ready] == waiting_room[:num_non_ready]):  
         await end_ready_up(channel)
 
 # New function to proceed to map voting
@@ -579,7 +608,6 @@ async def declare_selected_map(channel, selected_map):
 async def proceed_to_matchups_phase(channel):
     global phase, matchups, votes, voted_users, voting_message
     phase = Phase.MATCHUP
-    team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
     players = list(ready_players)
     unique_team_ids = set()
     # if team size is greater than 2, avoid rerolling a team from the last set of matchups
@@ -613,9 +641,17 @@ async def proceed_to_matchups_phase(channel):
     # Display the matchups
     await display_matchup_votes(channel)
 
+# Gets a string representation of the matchup    
+def get_matchup_str(m):
+    if m == reroll_key:
+        return 'Re-roll Matchups'
+    if m == custom_teams_key:
+        return 'Custom matchup'
+    return f'Matchup {m}'
+
 # Function to display the voting embed with votes count and enhanced readability
 async def display_matchup_votes(channel):
-    global reroll_votes, voting_message
+    global voting_message
     embed = discord.Embed(title='Matchup Vote', description='Vote for your preferred matchup or vote to re-roll.',
                           color=discord.Color.green())
 
@@ -630,8 +666,17 @@ async def display_matchup_votes(channel):
 
     # Clearer re-roll option with votes
     embed.add_field(name='——————————————————————————',
-                    value=f'**Re-roll Matchups** {vote_pip * reroll_votes}\nVote to re-roll all matchups and generate new ones.', 
+                    value=f'**Re-roll Matchups** {vote_pip * votes[reroll_key]}\nVote to re-roll all matchups and generate new ones.', 
                     inline=False)
+    # Custom teams
+    embed.add_field(name='——————————————————————————',
+                    value=f'**Custom** {vote_pip * votes[custom_teams_key]}\nUse !customt1 and !customt2 to set custom teams.', 
+                    inline=False)
+    if custom_team1 or custom_team2:
+        team1_names = '\n'.join([get_display_name(user) for user in custom_team1])
+        team2_names = '\n'.join([get_display_name(user) for user in custom_team2])
+        embed.add_field(name='Team 1', value=team1_names, inline=True)
+        embed.add_field(name='Team 2', value=team2_names, inline=True)
 
     # If the voting message exists, edit it, otherwise send a new one
     if voting_message:
@@ -661,90 +706,63 @@ class VotingView(View):
 
     @discord.ui.button(label='Re-roll 🎲', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
     async def vote_reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.register_reroll_vote(interaction)
+        await self.register_vote(interaction, reroll_key)
+    
+    @discord.ui.button(label='Custom', style=discord.ButtonStyle.secondary, custom_id='vote_custom')
+    async def vote_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.register_vote(interaction, custom_teams_key)
 
-    async def register_vote(self, interaction, matchup_number):
-        global final_matchup_sent  # To ensure the final matchup is only sent once
+    # handles registering a vote
+    async def register_vote(self, interaction, m):
+        global final_matchup_sent
         # do nothing if no longer in team voting phase
         if phase != Phase.MATCHUP:
             await interaction.response.send_message('This button is no longer active.', ephemeral=True, delete_after=msg_fade1)
             return
         
         user = interaction.user
-
         if user not in ready_players:
             await interaction.response.send_message('You are not part of the match.', ephemeral=True, delete_after=msg_fade1)
             return
-
-        # Allow user to change their vote
-        if user in voted_users:
+        if user in voted_users:  # if already voted
             previous_vote = voted_users[user]
-            if previous_vote == "reroll":
-                global reroll_votes
-                reroll_votes -= 1  # Remove their previous re-roll vote
-            else:
-                votes[previous_vote] -= 1  # Remove their previous matchup vote
+            if previous_vote == m:  # check if same vote
+                await interaction.response.send_message(f'You have already voted for {get_matchup_str(m)}.', ephemeral=True, delete_after=msg_fade1)
+                return
+            votes[previous_vote] -= 1  # remove their previous vote
+        voted_users[user] = m  # set user vote
+        votes[m] += 1  # update matchup vote count
+        await interaction.response.send_message(f'You voted for {get_matchup_str(m)}.', ephemeral=True, delete_after=msg_fade2)
 
-        votes[matchup_number] += 1
-        voted_users[user] = matchup_number
-
-        await interaction.response.send_message(f'You voted for Matchup {matchup_number}.', ephemeral=True, delete_after=msg_fade2)
-
-        # Check if any matchup has 5 votes (for 5v5)
-        if votes[matchup_number] >= votes_required and not final_matchup_sent:
-            final_matchup_sent = True  # Ensure this block runs only once
-            await declare_matchup(interaction.message.channel, matchup_number)
+        # Check if any matchup type has enough votes
+        if votes[m] >= votes_required:
+            if m == reroll_key:
+                await interaction.message.channel.send('Re-rolling the matchups!')
+                await proceed_to_matchups_phase(interaction.message.channel)
+                return
+            elif m == custom_teams_key and not final_matchup_sent:
+                final_matchup_sent = True  # Ensure this block runs only once
+                await declare_matchup(interaction.message.channel, -1)
+            elif not final_matchup_sent:
+                final_matchup_sent = True  # Ensure this block runs only once
+                await declare_matchup(interaction.message.channel, m)
 
         # Update the voting message
         await display_matchup_votes(interaction.message.channel)
-            
-
-    async def register_reroll_vote(self, interaction):
-        global reroll_votes, votes, voted_users
-        # do nothing if no longer in team voting phase
-        if phase != Phase.MATCHUP:
-            await interaction.response.send_message('This button is no longer active.', ephemeral=True, delete_after=msg_fade1)
-            return
-        
-        user = interaction.user
-
-        if user not in ready_players:
-            await interaction.response.send_message('You are not part of the match.', ephemeral=True, delete_after=msg_fade1)
-            return
-
-        # Allow user to change vote if they already voted for re-roll
-        if user in voted_users:
-            previous_vote = voted_users[user]
-            if previous_vote == "reroll":
-                await interaction.response.send_message('You have already voted to re-roll.', ephemeral=True, delete_after=msg_fade1)
-                return
-            else:
-                votes[previous_vote] -= 1  # Remove their previous matchup vote
-
-        reroll_votes += 1
-        voted_users[user] = "reroll"
-
-        await interaction.response.send_message('You voted to re-roll the matchups.', ephemeral=True, delete_after=msg_fade2)
-
-        if reroll_votes >= votes_required:
-            await interaction.followup.send('Re-rolling the matchups!', ephemeral=False)
-            # Reset votes and users before proceeding
-            votes.clear()
-            voted_users.clear()
-            reroll_votes = 0
-            await proceed_to_matchups_phase(interaction.message.channel)
-        else:
-            await display_matchup_votes(interaction.message.channel)
 
 # Function to declare the chosen matchup
 async def declare_matchup(channel, matchup_number):
     global phase, final_matchup_players, final_team1_names, final_team2_names
-
     phase = Phase.PLAY
-    team1, team2 = matchups[matchup_number - 1]
-    final_matchup_players = set(team1 + team2)  # Mark players in Final Matchup
-    final_team1_names = ', '.join([get_display_name(user) for user in team1])
-    final_team2_names = ', '.join([get_display_name(user) for user in team2])
+    if matchup_number == -1:  # custom teams
+        final_matchup_players = set(queue + custom_team1 + custom_team2)
+        final_team1_names = ', '.join([get_display_name(user) for user in custom_team1]) or 'custom'
+        final_team2_names = ', '.join([get_display_name(user) for user in custom_team2]) or 'custom'
+    else:
+        team1, team2 = matchups[matchup_number - 1]
+        final_matchup_players = set(team1 + team2)
+        final_team1_names = ', '.join([get_display_name(user) for user in team1])
+        final_team2_names = ', '.join([get_display_name(user) for user in team2])
 
     embed = discord.Embed(title='Final Matchup', color=discord.Color.gold())
     embed.add_field(name='Map', value=selected_map, inline=False)
@@ -954,7 +972,7 @@ async def end_pug(ctx):
              save_pug(save_file)
        except:
           print(f'{get_timestamp()} - Error saving PUG data.')
-       print(f'{get_timestamp()} - PUG saved with {len(queue)} players in queue.')
+       print(f'{get_timestamp()} - PUG saved with {total_queue_size()} players in queue.')
        # Reset the game state
        reset_game()
        phase = Phase.NONE
@@ -978,7 +996,7 @@ async def start_pug(ctx):
          try:
             with open(save_file_path, 'r') as save_file:
                load_pug(ctx, save_file)
-            print(f'{get_timestamp()} - PUG loaded with {len(queue)} players in queue.')
+            print(f'{get_timestamp()} - PUG loaded with {total_queue_size()} players in queue.')
             os.remove(save_file_path)
          except:
             print(f'{get_timestamp()} - Failed to load saved PUG: {save_file_path}')
@@ -1033,6 +1051,41 @@ async def queue_users(ctx, members: commands.Greedy[discord.Member]):
             await update_queue_message()
     else:
         await ctx.send('Cannot queue players, queue message not found.')
+
+# Command to set custom team 1
+@bot.command(name='customt1')
+async def customt1(ctx, members: commands.Greedy[discord.Member]):
+    global custom_team1
+    if phase <= Phase.READY:
+        await ctx.send(f'Cannot set custom teams until players are in a match.')
+        return
+    if phase >= Phase.PLAY:
+        await ctx.send(f'Cannot set custom teams once a final matchup has been decided.')
+        return
+    
+    custom_team1 = list(members[:team_size])
+    custom_team1_names = ', '.join([get_display_name(user) for user in custom_team1])
+    await ctx.send(f'Custom Team 1 has been set to: {custom_team1_names}.')
+    if phase == Phase.MATCHUP:
+        await display_matchup_votes(ctx.message.channel)
+
+# Command to set custom team 2
+@bot.command(name='customt2')
+async def customt2(ctx, members: commands.Greedy[discord.Member]):
+    global custom_team2
+    if phase <= Phase.READY:
+        await ctx.send(f'Cannot set custom teams until players are in a match.')
+        return
+    if phase >= Phase.PLAY:
+        await ctx.send(f'Cannot set custom teams once a final matchup has been decided.')
+        return
+    
+    custom_team2 = list(members[:team_size])
+    custom_team2_names = ', '.join([get_display_name(user) for user in custom_team2])
+    await ctx.send(f'Custom Team 2 has been set to: {custom_team2_names}.')
+    if phase == Phase.MATCHUP:
+        await display_matchup_votes(ctx.message.channel)
+
 
 # Run the bot
 bot.run(TOKEN)
