@@ -49,11 +49,39 @@ ready_dm_messages = [  # List of random messages to send when ready up begins
     "The PUGs queue is full. Go to the server and Ready Up!",
     "It's time for Giggin, go ready up!"
 ]
+queue_kill_comments = {
+    1: 'Queue-bait',
+    2: 'Queue-lapse',
+    3: 'Queue-logy',
+    4: 'Queue-thanasia',
+    5: 'Queue-genics',
+    6: 'Queue-splosion',
+    7: 'Queue-tastrophy',
+    8: 'Queue-lamity',
+    9: 'Queue-pocalypse',
+    10: 'Queue-termination'
+}
 
 # Constants used elsewhere in code
 divider = '——————————————————————————'  # divider string for votes
 reroll_key = 'reroll'  # key for reroll votes in votes dict
 custom_teams_key = 'custom'  # key for custom votes in votes dict
+command_help = {  # Help info for commands
+    'mh': '!mh - gets a search string to view your match history in discord',
+    'ct1': '!ct1 - use with user names to set Team 1 for Custom teams',
+    'ct2': '!ct2 - use with user names to set Team 2 for Custom teams',
+    's7': '!s7 - show the server join commands for syco.servegame.com port 7777',
+    's8': '!s8 - show the server join commands for syco.servegame.com port 7778',
+    's9': '!s9 - show the server join commands for syco.servegame.com port 7779',
+    's0': '!s0 - show the server join commands for syco.servegame.com port 7780',
+    'sb': '''!sb - use with an attached image to set the scoreboard of the current 
+     match, can also pass in the remaining wounds to set it at the 
+     same time ex. !sb -1''',
+    'wounds': '''!wounds - use with a number to indicate which team won the current
+         match and how many wounds, + for Team1 win, - for Team2 win:
+         !wounds 2    (Team 1 won the match with 2 wounds remaining)
+         !wounds -3   (Team 2 won the match with 3 wounds remaining)'''
+}
 
 # Set up the bot with necessary intents
 intents = discord.Intents.default()
@@ -234,6 +262,14 @@ class QueueView(View):
     @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_queue_leave(interaction)
+    
+    @discord.ui.button(label='Match History', style=discord.ButtonStyle.grey)
+    async def match_history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await reply_with_match_history(interaction)
+    
+    @discord.ui.button(label='Help', style=discord.ButtonStyle.grey)
+    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await reply_with_help(interaction)
 
 # Function to handle when a user clicks a join button for queue or waiting room
 async def handle_queue_join(interaction: discord.Interaction):
@@ -293,6 +329,16 @@ async def handle_queue_leave(interaction: discord.Interaction):
         await update_waiting_room_message()
     else:
         await update_queue_message()
+
+# Replies to a user with a match history message
+async def reply_with_match_history(interaction: discord.Interaction):
+    msg = match_history_block(interaction.user)
+    await interaction.response.send_message(msg, ephemeral=True, delete_after=msg_fade2)
+   
+# Replies to a user with a help message
+async def reply_with_help(interaction: discord.Interaction):
+    msg = f' Commands\n{command_help_block()}'
+    await interaction.response.send_message(msg, ephemeral=True)
 
 # Function to get the total number of players in queue + waiting room
 def total_queue_size():
@@ -379,6 +425,12 @@ async def update_ready_up_message():
         embed = ready_up_embed()
         await ready_message.edit(embed=embed)
 
+# Gets a killstreak string for the number of non-ready players
+def queue_killstreak_str(num):
+    if num in queue_kill_comments:
+        return f'***{queue_kill_comments[num]}*** {"💀" * num}'
+    return f'Not all players were ready.'
+
 # Countdown timer for the ready-up phase
 async def countdown_ready_up(channel):
     global ready_up_timed_out
@@ -426,7 +478,7 @@ async def end_ready_up(channel):
     phase = Phase.QUEUE
     game_in_progress = False
     all_ready_sent = False
-    await channel.send(f"Not all players were ready. Re-queuing {num_ready} ready players.")
+    await channel.send(f"{queue_killstreak_str(num_non_ready)} Re-queuing {num_ready} ready players.")
     ready_message = await remove_message(ready_message)
     queue_message = await remove_message(queue_message)
     await start_new_queue(channel)  # Post a new queue message with ready players
@@ -945,17 +997,25 @@ def waiting_room_embed():
 
 # View for the waiting room buttons
 class WaitingRoomView(View):
-   def __init__(self):
-       super().__init__(timeout=None)
+    def __init__(self):
+        super().__init__(timeout=None)
 
 
-   @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
-   async def join_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-       await handle_queue_join(interaction)
-
-   @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
-   async def leave_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
-       await handle_queue_leave(interaction)
+    @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
+    async def join_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_queue_join(interaction)
+    
+    @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
+    async def leave_waiting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_queue_leave(interaction)
+    
+    @discord.ui.button(label='Match History', style=discord.ButtonStyle.grey)
+    async def match_history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await reply_with_match_history(interaction)
+    
+    @discord.ui.button(label='Help', style=discord.ButtonStyle.grey)
+    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await reply_with_help(interaction)
 
 
 # restart queue after match is complete
@@ -1067,13 +1127,33 @@ def update_final_matchup_end():
 # updates the number of remaining wounds for the current match
 async def update_wounds(ctx, score):
     global final_matchup_score
-    final_matchup_score = max(-3, min(3, score))
+    new_score = max(-3, min(3, score))
+    if final_matchup_score == new_score:
+        await ctx.send(f'The remaining wounds of Match #{match_number} have already been set to {new_score}.')
+        return
+    final_matchup_score = new_score
     await update_final_matchup()
     if final_matchup_score == 0:
         await ctx.send(f'The winner and remaining wounds of Match #{match_number} have been cleared.')
     else:
         win_team = (-final_matchup_score // abs(final_matchup_score) + 1) // 2 + 1
         await ctx.send(f'Team {win_team} is the winner of Match #{match_number} with {abs(final_matchup_score)} wounds remaining.')
+
+# gets a block of text to explain how to search a user's match history
+def match_history_block(user):
+    username = user.name
+    botname = str(bot.user)
+    return f'''Copy this into the search bar to view your match history:
+`pug_mh from: {botname} mentions: {username}`
+- this tracks your discord account, so changing your nickname or in-game name is still ok
+- add a map name to the search string to only view games on that map
+- add `before:` `during:` or `after:` to search a sepcific date range
+- add a match number to the search string to view that exact match number'''
+
+# gets the code block of command help
+def command_help_block():
+    lines = '\n'.join([chelp for cname, chelp in command_help.items()])
+    return f'```{lines}```'
 
 # Command to end the PUG system
 @bot.command(name='end_pug')
@@ -1258,27 +1338,8 @@ async def wounds(ctx, score_str: str = 'x'):
 # Command to get match history search string
 @bot.command(name='mh')
 async def mh(ctx):
-    username = ctx.message.author.name
-    botname = str(ctx.me)
-    await ctx.send(f'Copy this into the search bar to view your match history:\n`pug_mh from: {botname} mentions: {username}`')
-
-# Command to get a list of public commands
-@bot.command(name='pughelp')
-async def pughelp(ctx):
-    await ctx.send(f'''```!pughelp - gets a list of available commands
-!mh - gets a search string to view your match history in discord
-!ct1 - use with user names or mentions to set Team 1 for Custom teams
-!ct2 - use with user names or mentions to set Team 2 for Custom teams
-!s7 - show the server join commands for syco.servegame.com port 7777
-!s8 - show the server join commands for syco.servegame.com port 7778
-!s9 - show the server join commands for syco.servegame.com port 7779
-!s0 - show the server join commands for syco.servegame.com port 7780
-!wounds - use with a number to indicate which team won the current match
-          and with how many wounds, + for Team1 win, - for Team2 win:
-          !wounds 2    (Team 1 won the match with 2 wounds remaining)
-          !wounds -3   (Team 2 won the match with 3 wounds remaining)
-!sb - use with an attached image to set the scoreboard of the current match
-      can also pass in the remaining wounds to set it at the same time```''')
+    msg = match_history_block(ctx.message.author)
+    await ctx.send(msg)
 
 # Run the bot
 bot.run(TOKEN)
