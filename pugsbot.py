@@ -2,7 +2,10 @@ import os
 import random
 import asyncio
 from collections import defaultdict
+from datetime import datetime
+import time
 from enum import Enum
+import math
 
 import discord
 from discord.ext import commands
@@ -20,12 +23,16 @@ intents.members = True  # To access member information
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# gets a timestamp to use when logging
+def get_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 @bot.event
 async def on_ready():
     # Set a custom status with the Jack-o'-Lantern emoji 🎃 and the message "Happy Halloween!!!"
     activity = discord.Activity(type=discord.ActivityType.playing, name="Gigantic PUGs")
     await bot.change_presence(status=discord.Status.online, activity=activity)
-    print(f'Logged in as {bot.user.name}')
+    print(f'{get_timestamp()} - Logged in as {bot.user.name}')
 
 # Phase enum
 class Phase(Enum):
@@ -37,7 +44,7 @@ class Phase(Enum):
     PLAY = 6
     
 # Global variables to keep track of the queue and game states
-phase = Phase.QUEUE
+phase = Phase.NONE
 queue = []
 waiting_room = []
 ready_players = set()
@@ -53,10 +60,14 @@ queue_message = None
 voting_message = None
 waiting_room_message = None  # For the waiting room message
 ready_message = None  # To store the ready-up message
+ready_start = 0  # for storing the timestamp of the start of the ready up countdown
+ready_end = 0  # for storing the timestamp of the end of the ready up countdown
 final_matchup_sent = False  # Track if the final matchup has already been sent
 ready_up_task = None  # For tracking the countdown task
 reset_in_progress = False  # Flag to prevent multiple resets
 final_matchup_players = set()  # Players in the final matchup
+final_team1_names = None
+final_team2_names = None
 
 # New global variables for map voting
 map_votes = defaultdict(int)
@@ -72,6 +83,7 @@ queue_size_required = 10  # 10 players required for 5v5
 reset_queue_votes_required = 4  # Require 4 votes to reset the queue
 votes_required = 5  # Require 5 votes to pick maps, matchups, or re-roll
 map_total_votes_required = 7  # Require 7 total votes to choose a map
+save_file_path = 'stored_pug.txt'  # Stores saved PUG data to load on next startup
 
 # Helper function to reset the game state but keep the waiting room intact
 def reset_game():
@@ -92,9 +104,13 @@ def reset_game():
     queue_message = None
     voting_message = None
     ready_message = None
+    ready_start = 0
+    ready_end = 0
     
     final_matchup_sent = False
     final_matchup_players = set()
+    final_team1_names = None
+    final_team2_names = None
     reset_in_progress = False  # Reset the flag
     map_votes = defaultdict(int)
     map_voted_users = {}
@@ -110,6 +126,14 @@ def reset_game():
 # Helper function to get a user's preferred display name
 def get_display_name(user):
     return user.nick or user.display_name or user.name
+
+# Function to make the queue embed
+def queue_embed():
+    queue_names = ', '.join([get_display_name(user) for user in queue]) or 'No players in queue.'
+    embed = discord.Embed(title='PUGs Queue',
+                          description=f'Players in queue ({len(queue)}/{queue_size_required}): {queue_names}',
+                          color=discord.Color.blue())
+    return embed
 
 # View for the join/leave queue buttons
 class QueueView(View):
@@ -152,13 +176,12 @@ class QueueView(View):
             await interaction.response.send_message('You are not in the queue.', ephemeral=True)
         await update_queue_message()
 
+
+
 # Function to update the queue message (editing the original message)
 async def update_queue_message():
     global queue_message, game_in_progress
-    queue_names = ', '.join([get_display_name(user) for user in queue]) or 'No players in queue.'
-    embed = discord.Embed(title='PUGs Queue',
-                          description=f'Players in queue ({len(queue)}/{queue_size_required}): {queue_names}',
-                          color=discord.Color.blue())
+    embed = queue_embed()
 
     # Remove buttons if the ready check has started
     if game_in_progress:
@@ -177,7 +200,7 @@ async def update_queue_message():
 
 # Function to start the ready check
 async def start_ready_check(channel):
-    global phase, ready_players, decline_ready_players, ready_up_task
+    global phase, ready_players, decline_ready_players, ready_start, ready_end, ready_up_task
     phase = Phase.READY
     ready_players = set()
     decline_ready_players = set()
@@ -205,6 +228,10 @@ async def start_ready_check(channel):
         except discord.Forbidden:
             print(f"Could not DM {user} due to privacy settings.")
 
+    # Get start and end times
+    ready_start = int(time.time())
+    ready_end = ready_start + ready_up_time
+
     # Start the ready-up process and display the message
     await display_ready_up(channel)
 
@@ -214,16 +241,7 @@ async def start_ready_check(channel):
 # Function to display the ready-up message
 async def display_ready_up(channel):
     global ready_message
-    ready_list = ', '.join([get_display_name(user) for user in ready_players]) or 'No players ready yet.'
-    not_ready_players = set(queue) - ready_players
-    not_ready_list = ', '.join([get_display_name(user) for user in not_ready_players]) or 'All players are ready.'
-
-    embed = discord.Embed(title='Ready Up Phase',
-                          description='The queue is full! Please ready up by clicking the "Ready Up" button.',
-                          color=discord.Color.green())
-    embed.add_field(name='Players Ready', value=f'{ready_list}', inline=False)
-    embed.add_field(name='Players Not Ready', value=f'{not_ready_list}', inline=False)
-    embed.set_footer(text=f'Time left: {ready_up_time} seconds')
+    embed = ready_up_embed()
 
     # Send the ready-up message and store its reference
     if ready_message:
@@ -232,16 +250,9 @@ async def display_ready_up(channel):
         ready_message = await channel.send(embed=embed, view=ReadyUpView())
 
 # Function to update the ready-up message (players and timer)
-async def update_ready_up_message(time_left):
+async def update_ready_up_message():
     global ready_message
-    ready_list = ', '.join([get_display_name(user) for user in ready_players]) or 'No players ready yet.'
-    not_ready_players = set(queue) - ready_players
-    not_ready_list = ', '.join([get_display_name(user) for user in not_ready_players]) or 'All players are ready.'
-
-    embed = discord.Embed(title='Ready Up Phase', color=discord.Color.green())
-    embed.add_field(name='Players Ready', value=f'{ready_list}', inline=False)
-    embed.add_field(name='Players Not Ready', value=f'{not_ready_list}', inline=False)
-    embed.set_footer(text=f'Time left: {time_left} seconds')
+    embed = ready_up_embed()
 
     # Edit the ready-up message with updated players and time
     if ready_message:
@@ -249,13 +260,8 @@ async def update_ready_up_message(time_left):
 
 # Countdown timer for the ready-up phase
 async def countdown_ready_up(channel):
-    global ready_up_time
-
-    # Loop through each second and update the message every second
-    for remaining in range(ready_up_time, 0, -1):  # Update every 1 second
-        await update_ready_up_message(remaining)
-        await asyncio.sleep(1)  # Wait 1 second between each update
-
+    #  Wait the full duration, since we now have a timestamp that counts down automatically
+    await asyncio.sleep(ready_up_time)
     # Timeout reached: proceed with ready players or reset queue
     await ready_up_timeout(channel)
 
@@ -285,6 +291,20 @@ async def ready_up_timeout(channel):
         await remove_old_queue_message()  # Remove the old queue message
         await start_new_queue(channel)
 
+# Function to make the ready up embed
+def ready_up_embed():
+    ready_list = ', '.join([get_display_name(user) for user in ready_players]) or 'No players ready yet.'
+    not_ready_players = set(queue) - ready_players
+    not_ready_list = ', '.join([get_display_name(user) for user in not_ready_players]) or 'All players are ready.'
+
+    embed = discord.Embed(title='Ready Up Phase',
+                          #description='The queue is full! Please ready up by clicking the "Ready Up" button.',
+                          color=discord.Color.green())
+    embed.add_field(name='Players Ready', value=f'{ready_list}', inline=False)
+    embed.add_field(name='Players Not Ready', value=f'{not_ready_list}', inline=False)
+    embed.add_field(name='\u200b', value=f'-# Expires: <t:{ready_end}:R>', inline=False)
+    return embed
+
 # View for the ready up button
 class ReadyUpView(View):
     def __init__(self):
@@ -298,7 +318,7 @@ class ReadyUpView(View):
                 decline_ready_players.remove(user)
             ready_players.add(user)
             await interaction.response.send_message(f'{user.mention} is ready!', ephemeral=True)
-            await update_ready_up_message(time_left=ready_up_time)  # Update the ready-up message with new players
+            await update_ready_up_message()  # Update the ready-up message with new players
             # Proceed immediately if all players are ready
             if len(ready_players) == queue_size_required:
                 await proceed_to_map_voting(interaction.message.channel)
@@ -318,7 +338,7 @@ class ReadyUpView(View):
                     await decline_and_requeue(user, interaction.message.channel)
             else:
                 decline_ready_players.add(user)
-                await interaction.response.send_message('Are you sure you want to decline the queue?  Click again to confirm.', ephemeral=True)
+                await interaction.response.send_message('Are you sure you want to bail out?  Click again to confirm.', ephemeral=True)
         else:
             await interaction.response.send_message('You are not in the queue.', ephemeral=True)
 
@@ -354,13 +374,25 @@ async def proceed_to_map_voting(channel):
     map_voted_users.clear()  # Reset users who voted
     map_voting_message = None
 
-    # Create the embed message
-    embed = discord.Embed(title='Map Voting', description='Vote for the map you want to play on.', color=discord.Color.green())
-    for map_name in map_choices:
-        embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=False)
+    embed = map_voting_embed()
 
     # Send the message with the MapVotingView
     map_voting_message = await channel.send(embed=embed, view=MapVotingView())
+
+# Function to make the map voting embed
+def map_voting_embed():
+    embed = discord.Embed(title='Map Voting', 
+                          #description='Vote for the map you want to play on.', 
+                          color=discord.Color.green())
+    for map_name in map_choices:
+        embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=True)
+    # add extra empty fields so that there are 3 fields per row
+    rem = len(map_choices) % 3
+    if rem != 0:
+        embed.add_field(name='\u200b', value='\u200b', inline=True)
+    if rem == 1:
+        embed.add_field(name='\u200b', value='\u200b', inline=True)
+    return embed
 
 # Class for map voting
 class MapVotingView(View):
@@ -424,9 +456,7 @@ class MapVotingView(View):
 async def update_map_voting_message():
     global map_voting_message
     if map_voting_message:
-        embed = discord.Embed(title='Map Voting', description='Vote for the map you want to play on.', color=discord.Color.green())
-        for map_name in map_choices:
-            embed.add_field(name=map_name, value=f'Votes: {map_votes[map_name]}', inline=True)
+        embed = map_voting_embed()
         await map_voting_message.edit(embed=embed)
 
 # Function to declare the selected map and proceed to matchups
@@ -444,13 +474,13 @@ async def proceed_to_matchups_phase(channel):
     unique_team_ids = set()
     votes.clear()  # Clear votes only at the start of new matchups
     voted_users.clear()  # Reset users who voted
+    team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
 
     # Generate matchups for 5v5
     while len(matchups) < 3:
-    for _ in range(3):
         random.shuffle(players)
-        team1 = players[:5]  # 5 players on team 1
-        team2 = players[5:]  # 5 players on team 2
+        team1 = players[:team_size]  # 5 players on team 1
+        team2 = players[team_size:]  # 5 players on team 2
         team1.sort(key=get_display_name)
         team2.sort(key=get_display_name)
         team1_ids = ' '.join([str(user.id) for user in team1])
@@ -475,12 +505,12 @@ async def display_matchup_votes(channel):
         team2_names = '\n'.join([get_display_name(user) for user in team2])
         embed.add_field(name='Team 1', value=team1_names, inline=True)
         embed.add_field(name='Team 2', value=team2_names, inline=True)
-        embed.add_field(name=f'▲▲▲ Matchup {idx} ({votes[idx]} votes) ▲▲▲',
+        embed.add_field(name=f'▲▲▲ Matchup {idx} (votes: {votes[idx]}) ▲▲▲',
                         value='——————————————————————',
                         inline=False)
 
     # Clearer re-roll option with votes
-    embed.add_field(name=f'Re-roll Matchups ({reroll_votes} votes)',
+    embed.add_field(name=f'Re-roll Matchups (votes: {reroll_votes})',
                     value='Vote to re-roll all matchups and generate new ones.', inline=False)
 
     # If the voting message exists, edit it, otherwise send a new one
@@ -494,19 +524,19 @@ class VotingView(View):
     def __init__(self):
         super().__init__(timeout=None)  # No timeout
 
-    @discord.ui.button(label='Vote Matchup 1', style=discord.ButtonStyle.primary, custom_id='vote_1')
+    @discord.ui.button(label='Matchup 1', style=discord.ButtonStyle.primary, custom_id='vote_1')
     async def vote_1(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_vote(interaction, 1)
 
-    @discord.ui.button(label='Vote Matchup 2', style=discord.ButtonStyle.primary, custom_id='vote_2')
+    @discord.ui.button(label='Matchup 2', style=discord.ButtonStyle.primary, custom_id='vote_2')
     async def vote_2(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_vote(interaction, 2)
 
-    @discord.ui.button(label='Vote Matchup 3', style=discord.ButtonStyle.primary, custom_id='vote_3')
+    @discord.ui.button(label='Matchup 3', style=discord.ButtonStyle.primary, custom_id='vote_3')
     async def vote_3(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_vote(interaction, 3)
 
-    @discord.ui.button(label='Vote Re-roll', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
+    @discord.ui.button(label='Re-roll', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
     async def vote_reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.register_reroll_vote(interaction)
 
@@ -537,12 +567,14 @@ class VotingView(View):
 
         await interaction.response.send_message(f'You voted for Matchup {matchup_number}.', ephemeral=True)
 
+        # Update the voting message
+        await display_matchup_votes(interaction.message.channel)
+
         # Check if any matchup has 5 votes (for 5v5)
         if votes[matchup_number] >= votes_required and not final_matchup_sent:
             final_matchup_sent = True  # Ensure this block runs only once
             await declare_matchup(interaction.message.channel, matchup_number)
-        else:
-            await display_matchup_votes(interaction.message.channel)
+            
 
     async def register_reroll_vote(self, interaction):
         global reroll_votes, votes, voted_users
@@ -583,18 +615,18 @@ class VotingView(View):
 
 # Function to declare the chosen matchup
 async def declare_matchup(channel, matchup_number):
-    global phase, waiting_room_message, final_matchup_players
+    global phase, waiting_room_message, final_matchup_players, final_team1_names, final_team2_names
 
     phase = Phase.PLAY
     team1, team2 = matchups[matchup_number - 1]
     final_matchup_players = set(team1 + team2)  # Mark players in Final Matchup
-    team1_names = ', '.join([get_display_name(user) for user in team1])
-    team2_names = ', '.join([get_display_name(user) for user in team2])
+    final_team1_names = ', '.join([get_display_name(user) for user in team1])
+    final_team2_names = ', '.join([get_display_name(user) for user in team2])
 
     embed = discord.Embed(title='Final Matchup', color=discord.Color.gold())
     embed.add_field(name='Map', value=selected_map, inline=False)
-    embed.add_field(name='Team 1', value=team1_names, inline=False)
-    embed.add_field(name='Team 2', value=team2_names, inline=False)
+    embed.add_field(name='Team 1', value=final_team1_names, inline=False)
+    embed.add_field(name='Team 2', value=final_team2_names, inline=False)
     embed.set_footer(text='Good luck and have fun!')
 
     await channel.send(embed=embed, view=ResetQueueView())
@@ -761,10 +793,7 @@ async def start_new_queue(channel):
    global phase, queue_message, waiting_room_message
    phase = Phase.QUEUE
    # Send a completely new queue message instead of editing the old one
-   queue_names = ', '.join([get_display_name(user) for user in queue]) or 'No players in queue.'
-   embed = discord.Embed(title='PUGs Queue',
-                         description=f'Players in queue ({len(queue)}/{queue_size_required}): {queue_names}',
-                         color=discord.Color.blue())
+   embed = queue_embed()
    queue_message = await channel.send(embed=embed, view=QueueView())
 
 
@@ -798,15 +827,36 @@ async def remove_ready_message():
            print("Ready message was already deleted.")
        ready_message = None
 
+# function to get a message with commands to join a syco server game
+def syco_commands_msg(port):
+    cmd1 = f'`open syco.servegame.com:{port}?team=0` (TEAM 1)'
+    cmd2 = f'`open syco.servegame.com:{port}?team=1` (TEAM 2)'
+    msg_lines = [cmd1]
+    if final_team1_names:
+        msg_lines.append(final_team1_names)
+        msg_lines.append('')
+    msg_lines.append(cmd2)
+    if final_team2_names:
+        msg_lines.append(final_team2_names)
+    return '\n'.join(msg_lines)
 
 # Command to end the PUG system
 @bot.command(name='end_pug')
 async def end_pug(ctx):
-   global game_in_progress, queue_message
-
-
-   if game_in_progress or queue:
-       reset_game()  # Reset the game state
+   global phase, game_in_progress, queue_message
+   if game_in_progress or queue_message:
+       print(f'{get_timestamp()} - ending PUGs')
+       # if final matchup has not been sent, save PUG data
+       if not final_matchup_sent:
+          try:
+             with open(save_file_path, 'w') as save_file:
+                save_file.write('\n'.join(str(user.id) for user in queue))
+          except:
+              print(f'{get_timestamp()} - Error saving PUG data.')
+          print(f'{get_timestamp()} - PUG saved with {len(queue)} players in queue.')
+       # Reset the game state
+       reset_game()
+       phase = Phase.NONE
        await ctx.send('The current PUG session has been ended. You can start a new queue with `!start_pug`.')
        if queue_message:
            await queue_message.edit(embed=discord.Embed(title="PUGs Queue", description="The PUG has been canceled.",
@@ -818,15 +868,69 @@ async def end_pug(ctx):
 # Command to start the PUG system
 @bot.command(name='start_pug')
 async def start_pug(ctx):
-   global phase, queue_message
-   if not game_in_progress and not queue:
-       phase = Phase.QUEUE
-       queue_message = await ctx.send(
-           embed=discord.Embed(title="PUGs Queue", description="No players in queue.", color=discord.Color.blue()),
-           view=QueueView())
+   global phase, queue, queue_message, game_in_progress
+   if not game_in_progress and not queue_message:
+      print(f'{get_timestamp()} - starting PUGs')
+      phase = Phase.QUEUE
+      # load data if it exists
+      if os.path.isfile(save_file_path):
+         queue = []
+         try:
+            with open(save_file_path, 'r') as save_file:
+               for id_line in save_file:
+                  user_id = int(id_line.strip())
+                  user = ctx.message.guild.get_member(user_id)
+                  #user = await ctx.message.guild.fetch_member(user_id)
+                  if user:
+                     print(f'adding user to queue: {get_display_name(user)}')
+                     queue.append(user)
+                  else:
+                      print(f'user not found')
+            print(f'{get_timestamp()} - PUG loaded with {len(queue)} players in queue.')
+            os.remove(save_file_path)
+         except:
+            print(f'{get_timestamp()} - Failed to load saved PUG: {save_file_path}')
+            queue = []   
+            
+      # send queue message
+      embed = queue_embed()
+      queue_message = await ctx.send(embed=embed, view=QueueView())
+      # If we have the required number of players, move to ready check
+      if len(queue) == queue_size_required and not game_in_progress:
+          game_in_progress = True
+          await start_ready_check(queue_message.channel)
    else:
        await ctx.send('A game is already in progress or the queue is active.')
 
+# Command to show the server join commands for syco.servegame.com port 7777
+@bot.command(name='s7')
+async def s7(ctx):
+    await ctx.send(syco_commands_msg(7777))
+    
+# Command to show the server join commands for syco.servegame.com port 7778
+@bot.command(name='s8')
+async def s8(ctx):
+    await ctx.send(syco_commands_msg(7778))
+    
+# Command to show the server join commands for syco.servegame.com port 7779
+@bot.command(name='s9')
+async def s9(ctx):
+    await ctx.send(syco_commands_msg(7779))
+    
+# Command to show the server join commands for syco.servegame.com port 7780
+@bot.command(name='s0')
+async def s0(ctx):
+    await ctx.send(syco_commands_msg(7780))
+    
+# Command to manually add users to the queue
+@bot.command(name='queue_users')
+async def queue_users(ctx, members: commands.Greedy[discord.Member]):
+    if not game_in_progress and queue_message:
+        queue.extend(members)
+        await ctx.send(f'Added {len(members)} players to queue.')
+        await update_queue_message()
+    else:
+        await ctx.send('Cannot queue players, a game is already in progress.')
 
 # Run the bot
 bot.run(TOKEN)
