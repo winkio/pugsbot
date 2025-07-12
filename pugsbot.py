@@ -324,7 +324,7 @@ class PugMatch():  # holds data for a single pug match
 
         # Custom teams
         if self.phase == Phase.MATCHUP:
-            custom_teams_text = f'**Custom**{self.matchup_vote_pips(custom_teams_key)}\nUse !ct1 and !ct2 to set custom teams.'
+            custom_teams_text = f'**Custom**{self.matchup_vote_pips(custom_teams_key)}\nUse !ct1 or !ct2 to set custom teams.'
         elif self.votes[custom_teams_key] or self.custom_team1 or self.custom_team2:
             custom_teams_text = f'**Custom**{self.matchup_vote_pips(custom_teams_key)}'
         else:
@@ -689,7 +689,7 @@ def queue_embed():
             match_names = ', '.join([get_display_name(user) for user in current_match.players]) or 'No players in match.'
             embed.add_field(name=f'Setting Up Match #{match_number}', value=match_names, inline=False)
         else:
-            queue_names = ', '.join([get_display_name(user) for user in queue]) or '*Empty*.'
+            queue_names = ', '.join([get_display_name(user) for user in queue]) or '*Empty*'
             embed.add_field(name=f'In Queue ({len(queue)}/{queue_size_required})', value=queue_names, inline=False)
         
         if waiting_room:
@@ -1044,7 +1044,11 @@ async def proceed_to_match_setup(channel):
     # remove old matches
     if len(matches) > max_matches_in_memory:
         min_match_number = min(matches)
-        del matches[min_match_number]
+        try:
+            del matches[min_match_number]
+        except:
+            print(f'Error removing match #{min_match_number} from cache')
+            
     # Send a completely new queue message instead of editing the old one
     embed = queue_embed()
     queue_message = await channel.send(embed=embed, view=QueueView())
