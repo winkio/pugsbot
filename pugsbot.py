@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
+class LogLevel(IntEnum):  # Log level order enum
+    NONE = 1
+    ERROR = 2
+    WARNING = 3
+    INFO = 4
+    VERBOSE = 5
+    ASYNC_CALLSTACK = 6
+
 class GameMap():
     def __init__(self, name, emoji):
         self.name = name
@@ -30,7 +38,10 @@ class RequeueOrder(IntEnum):  # Re-queue order enum
     NUM_WOUNDS = 5
 
 # Constants for settings
+has_initialized_after_first_login = False
+log_level = LogLevel.VERBOSE
 bot_activity = discord.Activity(type=discord.ActivityType.playing, name="Gigantic PUGs")
+queue_channel_id = 0
 ready_up_time = 90  # Set the ready-up time to 90 seconds
 queue_size_required = 10  # 10 players required for 5v5
 team_size = queue_size_required // 2 # // is integer division, / is float division which gives a float
@@ -50,7 +61,8 @@ map_choices = [  # List of GameMap objects describing maps
     GameMap('Sirens Strand', '🧊'), 
     GameMap('Sanctum Falls', '🌊'), 
     GameMap('Ember Grove', '🌲'), 
-    GameMap('Sky City', '☁️')
+    GameMap('Sky City', '☁️'),
+    GameMap('Night Reef', '🌙')
 ]
 ready_dm_messages = [  # List of random messages to send when ready up begins
     "The queue is full. Go Ready Up!",
@@ -71,6 +83,10 @@ queue_kill_comments = {
     9: 'Queue-pocalypse',
     10: 'Queue-termination'
 }
+admin_ids = [ # ids of admin users
+    235573260979273739, # Dave
+    111609038252277760  # winkio
+]
 
 # Constants used elsewhere in code
 divider = '——————————————————————————'  # divider string for votes
@@ -81,10 +97,17 @@ command_help = {  # Help info for commands
     'ct2': '!ct2 - use with user names to set Team 2 for Custom teams',
     'trade': '!trade - trades two players on opposite teams',
     'fill': '!fill - replaces a player in the match with one not in the match',
+    'a7': '!a7 - show the server join commands for anhur.servegame.com port 7777',
+    'a8': '!a8 - show the server join commands for anhur.servegame.com port 7778',
+    'f7': '!f7 - show the server join commands for floof.servegame.com port 7777',
+    'f8': '!f8 - show the server join commands for floof.servegame.com port 7778',
     's7': '!s7 - show the server join commands for syco.servegame.com port 7777',
     's8': '!s8 - show the server join commands for syco.servegame.com port 7778',
     's9': '!s9 - show the server join commands for syco.servegame.com port 7779',
     's0': '!s0 - show the server join commands for syco.servegame.com port 7780',
+    'custom_server': '!custom_server - set the address for the custom server used with c7 and c8 commands',
+    'c7': '!c7 - show the server join commands for the custom server port 7777',
+    'c8': '!c8 - show the server join commands for the custom server port 7778',
     'sb': '''!sb - use with an attached image to set the scoreboard of the current 
      match, can also pass in the remaining wounds to set it at the 
      same time ex. !sb -1''',
@@ -101,17 +124,48 @@ intents.members = True  # To access member information
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# custom server address used for c7 and c8 commands
+custom_server_address = ''
+
 # gets a timestamp to use when logging
 def get_timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# gets a prefix for the given log level
+def get_log_level_prefix(level: LogLevel):
+    match level:
+        case LogLevel.ERROR:
+            return 'ERROR: '
+        case LogLevel.WARNING:
+            return 'WARNING: '
+    return ''
+
+# logs a message
+def log_msg(level: LogLevel, msg: str):
+    if level <= log_level:
+        print(f'{get_timestamp()} - {get_log_level_prefix(level)}{msg}')
+
+# logs the start of an async call
+def log_async_start(name):
+    log_msg(LogLevel.ASYNC_CALLSTACK, f'▼ async {name}() ▼')
+
+# logs the end of an async call
+def log_async_end(name):
+    log_msg(LogLevel.ASYNC_CALLSTACK, f'▲ async {name}() ▲')
+
 @bot.event
 async def on_ready():
+    log_async_start('on_ready')
+    global has_initialized_after_first_login
     if bot_activity:
         await bot.change_presence(status=discord.Status.online, activity=bot_activity)
     else:
         await bot.change_presence(status=discord.Status.online)
-    print(f'{get_timestamp()} - Logged in as {bot.user.name} ({bot.user})')
+    log_msg(LogLevel.NONE, f'Logged in as {bot.user.name} ({bot.user})')
+    if not has_initialized_after_first_login:
+        has_initialized_after_first_login = True
+        await init_on_first_login()
+    log_async_end('on_ready')
 
 class Phase(IntEnum):  # Phase enum
     NONE = 1
@@ -169,17 +223,20 @@ class PugMatch():  # holds data for a single pug match
     
     # updates the re-queue
     def update_re_queue(self):
-        self.re_queue = list(players)  # Players re-queueing after current match
-        if re_queue_order == RequeueOrder.RANDOM:  # Randomize re-queue order
-            random.shuffle(self.re_queue)  
-        else:  # sort re-queue order
+        self.re_queue = list(self.players)  # Players re-queueing after current match
+        random.shuffle(self.re_queue)  # Randomize re-queue order
+        if re_queue_order != RequeueOrder.RANDOM:  # sort re-queue order
             self.re_queue.sort(key=re_queue_sort_key)
+            for user in self.re_queue:
+                log_msg(LogLevel.VERBOSE, f'sort key: {user} => {re_queue_sort_key(user)}')
     
     # Proceed to map voting
     async def proceed_to_map_voting(self, channel):
+        log_async_start('proceed_to_map_voting')
         embed = self.map_voting_embed()
         # Send the message with the MapVotingView
         self.map_voting_message = await channel.send(embed=embed, view=MapVotingView(self))
+        log_async_end('proceed_to_map_voting')
 
     # Gets the vote pip string for a given map
     def map_vote_pips(self, game_map: GameMap):
@@ -199,23 +256,28 @@ class PugMatch():  # holds data for a single pug match
                 
     # Update the map voting message
     async def update_map_voting_message(self):
+        log_async_start('update_map_voting_message')
         if self.map_voting_message:
             embed = self.map_voting_embed()
             if self.phase != Phase.MAP:
                 await self.map_voting_message.edit(embed=embed, view=None)  # remove buttons if not voting
             else:
                 await self.map_voting_message.edit(embed=embed)
+        log_async_end('update_map_voting_message')
     
     # handles a user voting for a map
     async def register_map_vote(self, interaction, game_map):
+        log_async_start('register_map_vote')
         # do nothing if no longer in map voting phase
         if self.phase != Phase.MAP:
             await interaction.response.send_message('This button is no longer active.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_map_vote')
             return
         
         user = interaction.user
         if user not in self.players:
             await interaction.response.send_message('You are not part of the match.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_map_vote')
             return
 
         # Allow user to change their vote
@@ -223,6 +285,7 @@ class PugMatch():  # holds data for a single pug match
             map_previous_vote = self.map_voted_users[user]
             if map_previous_vote == game_map:
                 await interaction.response.send_message(f'You have already voted for {game_map}.', ephemeral=True, delete_after=msg_fade1)
+                log_async_end('register_map_vote')
                 return
             else:
                 self.map_votes[map_previous_vote] -= 1  # Remove their previous map vote
@@ -247,14 +310,18 @@ class PugMatch():  # holds data for a single pug match
             top_maps = [gm for gm, count in self.map_votes.items() if count == max_votes]
             self.selected_map = random.choice(top_maps)  # If tie, select randomly among top maps
             await self.declare_selected_map(interaction.message.channel)
+        log_async_end('register_map_vote')
 
     # Function to declare the selected map and proceed to matchups
     async def declare_selected_map(self, channel):
+        log_async_start('declare_selected_map')
         await self.proceed_to_matchups_phase(channel)
         await self.update_map_voting_message()  # final update of map vote message
+        log_async_end('declare_selected_map')
 
     # Adjusted function to proceed to matchups
     async def proceed_to_matchups_phase(self, channel):
+        log_async_start('proceed_to_matchups_phase')
         self.set_phase(Phase.MATCHUP)
         player_pool = list(self.players)
         unique_team_ids = set()
@@ -288,6 +355,7 @@ class PugMatch():  # holds data for a single pug match
                 
         # Display the matchups
         await self.display_matchup_votes(channel)
+        log_async_end('proceed_to_matchups_phase')
     
     # gets the vote pip string for a given matchup
     def matchup_vote_pips(self, m):
@@ -297,6 +365,7 @@ class PugMatch():  # holds data for a single pug match
 
     # Function to display the voting embed with votes count and enhanced readability
     async def display_matchup_votes(self, channel):
+        log_async_start('display_matchup_votes')
         if self.phase == Phase.MATCHUP:
             embed = discord.Embed(title='Matchup Vote', description='Vote for your preferred matchup or vote to re-roll.',
                                   color=discord.Color.green())
@@ -345,6 +414,7 @@ class PugMatch():  # holds data for a single pug match
                 await self.voting_message.edit(embed=embed)
         else:
             self.voting_message = await channel.send(embed=embed, view=MatchupVotingView(self))
+        log_async_end('display_matchup_votes')
     
     # Gets a string representation of the matchup    
     def get_matchup_str(self, m):
@@ -356,19 +426,23 @@ class PugMatch():  # holds data for a single pug match
     
     # handles registering a matchup vote
     async def register_matchup_vote(self, interaction, m):
+        log_async_start('register_matchup_vote')
         # do nothing if no longer in team voting phase
         if self.phase != Phase.MATCHUP:
             await interaction.response.send_message('This button is no longer active.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_matchup_vote')
             return
         
         user = interaction.user
         if user not in self.players:
             await interaction.response.send_message('You are not part of the match.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_matchup_vote')
             return
         if user in self.voted_users:  # if already voted
             previous_vote = self.voted_users[user]
             if previous_vote == m:  # check if same vote
                 await interaction.response.send_message(f'You have already voted for {self.get_matchup_str(m)}.', ephemeral=True, delete_after=msg_fade1)
+                log_async_end('register_matchup_vote')
                 return
             self.votes[previous_vote] -= 1  # remove their previous vote
         self.voted_users[user] = m  # set user vote
@@ -380,6 +454,7 @@ class PugMatch():  # holds data for a single pug match
             if m == reroll_key:
                 await interaction.message.channel.send('Re-rolling the matchups!')
                 await self.proceed_to_matchups_phase(interaction.message.channel)
+                log_async_end('register_matchup_vote')
                 return
             elif m == custom_teams_key and not self.final_matchup_sent:
                 self.final_matchup_sent = True  # Ensure this block runs only once
@@ -390,9 +465,11 @@ class PugMatch():  # holds data for a single pug match
 
         # Update the voting message
         await self.display_matchup_votes(interaction.message.channel)
+        log_async_end('register_matchup_vote')
     
     # Declare the chosen matchup
     async def declare_matchup(self, channel, matchup_number):
+        log_async_start('declare_matchup')
         global results_match
         self.set_phase(Phase.PLAY)
         results_match = self
@@ -413,9 +490,11 @@ class PugMatch():  # holds data for a single pug match
         # Create the new waiting room after final matchup
         await create_waiting_room(channel)
         await update_queue_message() # single update of queue message for new phase
+        log_async_end('declare_matchup')
     
     # Updates the final matchup message
     async def update_final_matchup(self):
+        log_async_start('update_final_matchup')
         embed = self.final_matchup_embed()
         if self.final_matchup_message:
             if self.phase != Phase.PLAY:
@@ -424,6 +503,7 @@ class PugMatch():  # holds data for a single pug match
                 await self.final_matchup_message.edit(content=content, embed=embed, view=None)
             else:
                 await self.final_matchup_message.edit(embed=embed)
+        log_async_end('update_final_matchup')
 
     # gets the matchup length in seconds
     def matchup_length(self):
@@ -464,15 +544,19 @@ class PugMatch():  # holds data for a single pug match
     
     # Handles a match complete vote
     async def register_reset_vote(self, interaction):
+        log_async_start('register_reset_vote')
         user = interaction.user
         if user in self.reset_voted_users:
             await interaction.response.send_message('You have already marked the match as complete.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_reset_vote')
             return
         if user not in self.players:
             await interaction.response.send_message('You are not in the current match and cannot mark the match as complete.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_reset_vote')
             return
         if self.reset_in_progress:  # Prevent triggering multiple resets
             await interaction.response.send_message('Queue reset is already in progress.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('register_reset_vote')
             return
            
         self.reset_queue_votes += 1
@@ -487,9 +571,11 @@ class PugMatch():  # holds data for a single pug match
             self.reset_in_progress = True  # Prevent multiple resets
             await interaction.message.channel.send(f'Match #{self.match_number} marked as complete by vote.  Resetting queue...')
             await restart_queue(interaction.message.channel)  # Reset the queue and send a new queue message
+        log_async_end('register_reset_vote')
 
     # replaces a player in the match
     async def replace_player(self, p_out, p_in, channel):
+        log_async_start('replace_player')
         replace_list_item(self.players, p_out, p_in)
         replace_list_item(self.re_queue, p_out, p_in)
         if self.phase == Phase.MAP:
@@ -530,10 +616,12 @@ class PugMatch():  # holds data for a single pug match
                 self.final_team2.sort(key=user_sort_key)
                 self.final_team2_names = ', '.join([get_display_name(user) for user in self.final_team2]) or 'custom'
             await self.update_final_matchup()  # update embed
+        log_async_end('replace_player')
             
     
     # updates UI when custom teams are changed
     async def on_custom_teams_changed(self, channel):
+        log_async_start('on_custom_teams_changed')
         self.custom_team1.sort(key=user_sort_key)
         self.custom_team2.sort(key=user_sort_key)
         if self.phase == Phase.MATCHUP:
@@ -544,9 +632,11 @@ class PugMatch():  # holds data for a single pug match
             self.final_team1_names = ', '.join([get_display_name(user) for user in self.final_team1]) or 'custom'
             self.final_team2_names = ', '.join([get_display_name(user) for user in self.final_team2]) or 'custom'
             await self.update_final_matchup()
+        log_async_end('on_custom_teams_changed')
     
     # updates UI when final teams are changed by a trade or fill
     async def on_final_teams_changed(self, channel):
+        log_async_start('on_final_teams_changed')
         self.final_team1.sort(key=user_sort_key)
         self.final_team2.sort(key=user_sort_key)
         self.final_team1_names = ', '.join([get_display_name(user) for user in self.final_team1]) or 'custom'
@@ -558,6 +648,7 @@ class PugMatch():  # holds data for a single pug match
             await self.display_matchup_votes(channel)
         elif self.phase == Phase.PLAY:
             await self.update_final_matchup()
+        log_async_end('on_final_teams_changed')
     
     # updates final matchup start time to the current time
     def update_start_time(self):
@@ -571,17 +662,21 @@ class PugMatch():  # holds data for a single pug match
     
     # updates the scoreboard for the match
     async def update_scoreboard(self, ctx, scoreboard_img):
+        log_async_start('update_scoreboard')
         self.scoreboard_filename = scoreboard_img.filename
         await self.final_matchup_message.edit(attachments=[scoreboard_img])
         await self.update_final_matchup()
         await ctx.send(f'Updated scoreboard for Match #{self.match_number}.')
         self.update_end_time()  # update match end time
+        log_async_end('update_scoreboard')
     
     # updates the number of remaining wounds for the match
     async def update_wounds(self, ctx, score):
+        log_async_start('update_wounds')
         new_score = max(-3, min(3, score))
         if self.wound_score == new_score:
             await ctx.send(f'The remaining wounds of Match #{self.match_number} have already been set to {new_score}.')
+            log_async_end('update_wounds')
             return
         self.wound_score = new_score
         await self.update_final_matchup()
@@ -590,6 +685,7 @@ class PugMatch():  # holds data for a single pug match
         else:
             win_team = (-self.wound_score // abs(self.wound_score) + 1) // 2 + 1
             await ctx.send(f'Team {win_team} is the winner of Match #{self.match_number} with {abs(self.wound_score)} wounds remaining.')
+        log_async_end('update_wounds')
     
 # Global variables to keep track of the queue and game states
 phase = Phase.NONE
@@ -670,8 +766,8 @@ def re_queue_sort_key(user):
             return -1
         # get recent matches that the player was in
         min_end_time = current_match.setup_start_time - recent_time
-        recent_matches = [m for n, m in matches if (m.end_time and m.end_time >= min_end_time and 
-                                                    user in m.players)]
+        recent_matches = [m for n, m in matches.items() if (m.end_time and m.end_time >= min_end_time and 
+                                                            user in m.players)]
         match re_queue_order:
             case RequeueOrder.PLAY_TIME:
                 return sum([m.matchup_length() for m in recent_matches])
@@ -709,29 +805,40 @@ class QueueView(View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label='Join Queue', style=discord.ButtonStyle.green)
-    async def join_queue(self, interaction: discord.Interaction, button: discord.ui.Button):          
+    async def join_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('join_queue')
         await handle_queue_join(interaction)
+        log_async_end('join_queue')
 
     @discord.ui.button(label='Leave Queue', style=discord.ButtonStyle.red)
     async def leave_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('leave_queue')
         await handle_queue_leave(interaction)
+        log_async_end('leave_queue')
     
     @discord.ui.button(label='Match History', style=discord.ButtonStyle.grey)
     async def match_history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('match_history_button')
         await reply_with_match_history(interaction)
+        log_async_end('match_history_button')
     
     @discord.ui.button(label='Help', style=discord.ButtonStyle.grey)
     async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('help_button')
         await reply_with_help(interaction)
+        log_async_end('help_button')
 
 # Function to handle when a user clicks a join button for queue or waiting room
 async def handle_queue_join(interaction: discord.Interaction):
+    log_async_start('handle_queue_join')
     user = interaction.user
     if current_match and user in current_match.re_queue:
         await interaction.response.send_message('You are already set to re-queue.', ephemeral=True, delete_after=msg_fade1)
+        log_async_end('handle_queue_join')
         return
     if user in waiting_room:
         await interaction.response.send_message('You are already in the waiting room.', ephemeral=True, delete_after=msg_fade1)
+        log_async_end('handle_queue_join')
         return
     elif user in queue:
         if phase > Phase.READY and current_match: # if past the ready phase, set player to re-queue
@@ -739,6 +846,7 @@ async def handle_queue_join(interaction: discord.Interaction):
             await interaction.response.send_message(f'{user.mention} is set to re-queue!', ephemeral=True, delete_after=msg_fade2)
         else:
             await interaction.response.send_message('You are already in the queue.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('handle_queue_join')
             return
     else:  # user not in queue or waiting room yet
         if len(queue) < queue_size_required:  # if room in the queue add the user
@@ -752,9 +860,12 @@ async def handle_queue_join(interaction: discord.Interaction):
         await update_waiting_room_message()
     else:
         await update_queue_message()
+    try_save_pug() # save state automatically
+    log_async_end('handle_queue_join')
     
 # Function to handle when a user clicks a leave button for queue or waiting room
 async def handle_queue_leave(interaction: discord.Interaction):
+    log_async_start('handle_queue_leave')
     user = interaction.user
     if current_match and user in current_match.re_queue:
         current_match.re_queue.remove(user)
@@ -762,6 +873,7 @@ async def handle_queue_leave(interaction: discord.Interaction):
     elif user in waiting_room:
         if phase == Phase.READY and user in standby:
             await interaction.response.send_message('You cannot leave the queue while on Standby.', ephemeral=True, delete_after=msg_fade1)
+            log_async_end('handle_queue_leave')
             return
         waiting_room.remove(user)
         await interaction.response.send_message(f'{user.mention} left the waiting room!', ephemeral=True, delete_after=msg_fade2)
@@ -776,22 +888,29 @@ async def handle_queue_leave(interaction: discord.Interaction):
         await interaction.response.send_message(f'{user.mention} left the queue.', ephemeral=True, delete_after=msg_fade2)
     else:
         await interaction.response.send_message('You are not in the queue.', ephemeral=True, delete_after=msg_fade1)
+        log_async_end('handle_queue_leave')
         return
     
     if phase >= Phase.PLAY:
         await update_waiting_room_message()
     else:
         await update_queue_message()
+    try_save_pug() # save state automatically
+    log_async_end('handle_queue_leave')
 
 # Replies to a user with a match history message
 async def reply_with_match_history(interaction: discord.Interaction):
+    log_async_start('reply_with_match_history')
     msg = match_history_block(interaction.user)
     await interaction.response.send_message(msg, ephemeral=True, delete_after=msg_fade2)
+    log_async_end('reply_with_match_history')
    
 # Replies to a user with a help message
 async def reply_with_help(interaction: discord.Interaction):
+    log_async_start('reply_with_help')
     msg = f' Commands\n{command_help_block()}'
     await interaction.response.send_message(msg, ephemeral=True)
+    log_async_end('reply_with_help')
 
 # Function to get the total number of players in queue + waiting room
 def total_queue_size():
@@ -801,6 +920,7 @@ def total_queue_size():
 
 # Function to update the queue message (editing the original message)
 async def update_queue_message():
+    log_async_start('update_queue_message')
     global queue_message
     embed = queue_embed()
 
@@ -815,16 +935,20 @@ async def update_queue_message():
     # If we have the required number of players, move to ready check
     if phase == Phase.QUEUE:
         await check_full_queue()
+    log_async_end('update_queue_message')
 
 # Function that checks if we have the required number of players, and if so moves to ready check
 async def check_full_queue():
+    log_async_start('check_full_queue')
     global game_in_progress
     if len(queue) == queue_size_required and not game_in_progress:
         game_in_progress = True
         await start_ready_check(queue_message.channel)
+    log_async_end('check_full_queue')
 
 # Function to start the ready check
 async def start_ready_check(channel):
+    log_async_start('start_ready_check')
     global phase, queue_sorted, ready_players, bailouts_unc, bailouts, standby, ready_start, ready_end, ready_up_task
     phase = Phase.READY
     ready_players = set()
@@ -844,7 +968,7 @@ async def start_ready_check(channel):
             random_message = random.choice(ready_dm_messages)  # Select a random message
             await user.send(random_message)
         except discord.Forbidden:
-            print(f"Could not DM {user} due to privacy settings.")
+            log_msg(LogLevel.WARNING, f'Could not DM {user} due to privacy settings.')
 
     # create sorted queue
     queue_sorted = list(queue)
@@ -860,9 +984,11 @@ async def start_ready_check(channel):
     # Start the ready-up timer task
     ready_up_timed_out = False
     ready_up_task = asyncio.create_task(countdown_ready_up(channel))
+    log_async_end('start_ready_check')
 
 # Function to display the ready-up message
 async def display_ready_up(channel):
+    log_async_start('display_ready_up')
     global ready_message
     embed = ready_up_embed()
 
@@ -871,12 +997,15 @@ async def display_ready_up(channel):
         await ready_message.edit(embed=embed)
     else:
         ready_message = await channel.send(embed=embed, view=ReadyUpView())
+    log_async_end('display_ready_up')
 
 # Function to update the ready-up message (players and timer)
 async def update_ready_up_message():
+    log_async_start('update_ready_up_message')
     if ready_message:
         embed = ready_up_embed()
         await ready_message.edit(embed=embed)
+    log_async_end('update_ready_up_message')
 
 # Gets a killstreak string for the number of non-ready players
 def queue_killstreak_str(num):
@@ -886,17 +1015,21 @@ def queue_killstreak_str(num):
 
 # Countdown timer for the ready-up phase
 async def countdown_ready_up(channel):
+    log_async_start('countdown_ready_up')
     global ready_up_timed_out
     #  Wait the full duration, since we now have a timestamp that counts down automatically
     await asyncio.sleep(ready_up_time)
     # Timeout reached: proceed with ready players or reset queue
     ready_up_timed_out = True
     await end_ready_up(channel)
+    log_async_end('countdown_ready_up')
 
 # Ends a ready up phase, called when either the timer runs out or all players have readied/bailed
 async def end_ready_up(channel):
+    log_async_start('end_ready_up')
     global phase, queue, waiting_room, game_in_progress, queue_message, ready_players, all_ready_sent, ready_message
     if phase != Phase.READY or all_ready_sent:
+        log_async_end('end_ready_up')
         return
     all_ready_sent = True
         
@@ -918,6 +1051,7 @@ async def end_ready_up(channel):
             waiting_room = [user for user in waiting_room if user not in queue]
             await channel.send(f"Standby players have joined the match: {mentions}.  Thank you for filling in!")
         await proceed_to_match_setup(channel)
+        log_async_end('end_ready_up')
         return
     
     # Ready up failed, move users from waiting room to queue
@@ -935,6 +1069,7 @@ async def end_ready_up(channel):
     ready_message = await remove_message(ready_message)
     queue_message = await remove_message(queue_message)
     await start_new_queue(channel)  # Post a new queue message with ready players
+    log_async_end('end_ready_up')
 
 # gets a string with the queue icon and display name of a user in the queue
 def queue_icon_name(user):
@@ -965,6 +1100,7 @@ class ReadyUpView(View):
 
     @discord.ui.button(label='Ready Up / Standby', style=discord.ButtonStyle.green)
     async def ready_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('ready_up')
         global standby, all_ready_sent
         user = interaction.user
         if user in queue:
@@ -994,9 +1130,11 @@ class ReadyUpView(View):
             await interaction.response.send_message(f'{user.mention} is on standby!', ephemeral=True, delete_after=ready_up_time)
             await update_ready_up_message()
             await check_ready_complete(interaction.message.channel)
+        log_async_end('ready_up')
             
     @discord.ui.button(label='Bail Out', style=discord.ButtonStyle.red)
     async def bail_out(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('bail_out')
         user = interaction.user
         if user in ready_players or user in standby:
             await interaction.response.send_message('Cannot bail out after clicking ready.', ephemeral=True, delete_after=msg_fade1)
@@ -1012,9 +1150,11 @@ class ReadyUpView(View):
                 await check_ready_complete(interaction.message.channel)
         else:
             await interaction.response.send_message('You are not in the queue.', ephemeral=True, delete_after=msg_fade1)
+        log_async_end('bail_out')
 
 # checks if enough players have readied for the queue to go through
 async def check_ready_complete(channel):
+    log_async_start('check_ready_complete')
     num_non_ready = queue_size_required - len(ready_players)
     if num_non_ready == 0:  # if all users are ready
         await end_ready_up(channel)
@@ -1025,9 +1165,11 @@ async def check_ready_complete(channel):
         len(standby) >= num_non_ready and
         standby[:num_non_ready] == waiting_room[:num_non_ready]):  
         await end_ready_up(channel)
+    log_async_end('check_ready_complete')
 
 # proceeds to match setup
 async def proceed_to_match_setup(channel):
+    log_async_start('proceed_to_match_setup')
     global phase, current_match, queue_message, ready_message, ready_up_task
     phase = Phase.MAP
     # Cancel the ready-up task to prevent it from running after this point
@@ -1041,19 +1183,17 @@ async def proceed_to_match_setup(channel):
     new_match = PugMatch(match_number, queue)
     matches[match_number] = new_match
     current_match = new_match
+    new_match.update_re_queue() # update requeue order
     # remove old matches
     if len(matches) > max_matches_in_memory:
         min_match_number = min(matches)
-        try:
-            del matches[min_match_number]
-        except:
-            print(f'Error removing match #{min_match_number} from cache')
-            
+        del matches[min_match_number]
     # Send a completely new queue message instead of editing the old one
     embed = queue_embed()
     queue_message = await channel.send(embed=embed, view=QueueView())
     
     await new_match.proceed_to_map_voting(channel)
+    log_async_end('proceed_to_match_setup')
 
 # Class for map voting
 class MapVotingView(View):
@@ -1078,23 +1218,33 @@ class MatchupVotingView(View):
 
     @discord.ui.button(label='Matchup 1', style=discord.ButtonStyle.primary, custom_id='vote_1')
     async def vote_1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('vote_1')
         await self.match.register_matchup_vote(interaction, 1)
+        log_async_end('vote_1')
 
     @discord.ui.button(label='Matchup 2', style=discord.ButtonStyle.primary, custom_id='vote_2')
     async def vote_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('vote_2')
         await self.match.register_matchup_vote(interaction, 2)
+        log_async_end('vote_2')
 
     @discord.ui.button(label='Matchup 3', style=discord.ButtonStyle.primary, custom_id='vote_3')
     async def vote_3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('vote_3')
         await self.match.register_matchup_vote(interaction, 3)
+        log_async_end('vote_3')
 
     @discord.ui.button(label='Re-roll 🎲', style=discord.ButtonStyle.secondary, custom_id='vote_reroll')
     async def vote_reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('vote_reroll')
         await self.match.register_matchup_vote(interaction, reroll_key)
+        log_async_end('vote_reroll')
     
     @discord.ui.button(label='Custom', style=discord.ButtonStyle.secondary, custom_id='vote_custom')
     async def vote_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('vote_custom')
         await self.match.register_matchup_vote(interaction, custom_teams_key)
+        log_async_end('vote_custom')
 
 
 
@@ -1107,22 +1257,28 @@ class FinalMatchupView(View):
  
     @discord.ui.button(label='Match Complete', style=discord.ButtonStyle.red)
     async def complete_match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        log_async_start('complete_match')
         await self.match.register_reset_vote(interaction)
+        log_async_end('complete_match')
 
 # Create a waiting room for players not in the Final Matchup
 async def create_waiting_room(channel):
+   log_async_start('create_waiting_room')
    global waiting_room_message
    embed = waiting_room_embed()
    if waiting_room_message:
        await waiting_room_message.edit(embed=embed)
    else:
        waiting_room_message = await channel.send(embed=embed, view=QueueView())
+   log_async_end('create_waiting_room')
 
 # Function to update the waiting room message
 async def update_waiting_room_message():
+   log_async_start('update_waiting_room_message')
    if waiting_room_message:
        embed = waiting_room_embed()
        await waiting_room_message.edit(embed=embed)
+   log_async_end('update_waiting_room_message')
 
 # Function to make the waiting room embed
 def waiting_room_embed():
@@ -1145,6 +1301,7 @@ def waiting_room_embed():
 
 # restart queue after match is complete
 async def restart_queue(channel):
+    log_async_start('restart_queue')
     global phase, match_number, current_match
     phase = Phase.RESET
     results_match.phase = Phase.RESET
@@ -1157,6 +1314,7 @@ async def restart_queue(channel):
     match_number += 1  # increment match number
     current_match = None
     await start_new_queue(channel)  # Start a new queue with waiting room players
+    log_async_end('restart_queue')
 
 
 # Add waiting room players to the new queue
@@ -1171,29 +1329,78 @@ def add_waiting_room_players_to_queue():
 
 # Start a new queue programmatically without needing the command context
 async def start_new_queue(channel):
+   log_async_start('start_new_queue')
    global phase, queue_message, waiting_room_message
    phase = Phase.QUEUE
    # Send a completely new queue message instead of editing the old one
    embed = queue_embed()
    queue_message = await channel.send(embed=embed, view=QueueView())
    waiting_room_message = await remove_message(waiting_room_message)
+   try_save_pug() # save state automatically
    await check_full_queue()
+   log_async_end('start_new_queue')
    
 # Function to remove the given message (message = await remove_message(message))
 async def remove_message(message: discord.Message):
+   log_async_start('remove_message')
    if message:
        try:
            await message.delete()
        except discord.NotFound:
-           print("Message was already deleted.")
+           log_msg(LogLevel.WARNING, 'Message was already deleted')
+   log_async_end('remove_message')
    return None
+
+# initializes bot after first login
+async def init_on_first_login():
+    log_async_start('init_on_first_login')
+    global phase, queue, queue_message
+    # load saved data if it exists
+    if os.path.isfile(save_file_path):
+        queue = []
+        try:
+            with open(save_file_path, 'r') as save_file:
+                load_pug(None, save_file)
+                log_msg(LogLevel.NONE, f'PUG loaded on match #{match_number} with {total_queue_size()} players in queue')
+        except:
+            log_msg(LogLevel.ERROR, f'Failed to load saved PUG: {save_file_path}') 
+            queue = []
+            log_async_end('init_on_first_login')
+            return
+        if queue_channel_id == 0: # if no channel id stored, do not start queue
+            log_msg(LogLevel.WARNING, f'No queue channel found in loaded pug')
+            return
+        log_msg(LogLevel.NONE, f'Automatically starting queue')
+        phase = Phase.QUEUE
+        channel = bot.get_channel(queue_channel_id)
+        # send queue message
+        embed = queue_embed()
+        queue_message = await channel.send(embed=embed, view=QueueView())
+        # If we have the required number of players, move to ready check
+        await check_full_queue()
+    log_async_end('init_on_first_login')
+
+# attempts to save the pug state to a file
+def try_save_pug():
+    try:
+        with open(save_file_path, 'w') as save_file:
+            save_pug(save_file)
+        log_msg(LogLevel.NONE, f'PUG saved on match #{match_number} with {total_queue_size()} players in queue') 
+    except:
+        log_msg(LogLevel.ERROR, 'Error saving PUG data') 
+        return False
+    return True
 
 # function to save the current PUG state to a file    
 def save_pug(file):
+    file.write(f'match\n')
     if phase >= Phase.PLAY: # if final matchup has been posted, save the next match number
         file.write(f'{match_number + 1}\n')
     else:
         file.write(f'{match_number}\n')
+    file.write(f'channel\n')
+    file.write(f'{queue_channel_id}\n')
+    file.write(f'players\n')
     if phase < Phase.PLAY and queue:
         file.write('\n'.join(str(user.id) for user in queue))
         file.write('\n')
@@ -1204,30 +1411,41 @@ def save_pug(file):
         file.write('\n'.join(str(user.id) for user in current_match.re_queue))
         file.write('\n')
         
-# function to save the PUG state from a file    
-def load_pug(ctx, file):
-    global match_number
+# function to load the PUG state from a file    
+def load_pug(guild, file):
+    global match_number, queue_channel_id
+    line_type = 'match' # backwards compatibility with file that is match number followed by players
     for id_line in file:
         id_line_strip = id_line.strip()
-        if not id_line_strip.isdecimal():
+        if not id_line_strip.isdecimal(): # non-number is line type
+            if (len(id_line_strip) > 0):
+                line_type = id_line_strip
             continue
         num = int(id_line_strip)
-        if 0 < num and num < 999999999: # num is match number
-            match_number = num
-            continue
-        user = ctx.message.guild.get_member(num)  # num is user id
-        if user:
-            if len(queue) < queue_size_required:
-                queue.append(user)
-            else:
-                waiting_room.append(user)
-        else:
-            print(f'user not found: id={num}')
+        match line_type:
+            case 'match':
+                match_number = num
+                line_type = 'players' # backwards compatibility with file that is match number followed by players
+            case 'channel':
+                queue_channel_id = num
+                if not guild: # if not coming from a !pug_start command, get the saved channel's guild
+                    guild = bot.get_channel(queue_channel_id).guild
+            case 'players':
+                user = guild.get_member(num) # num is user id
+                if user:
+                    if len(queue) < queue_size_required:
+                        if user not in queue:
+                            queue.append(user)
+                    else:
+                        if user not in waiting_room:
+                            waiting_room.append(user)
+                else:
+                    log_msg(LogLevel.WARNING, f'user not found: id={num}')
 
-# function to get a message with commands to join a syco server game
-def syco_commands_msg(port):
-    cmd1 = f'`open syco.servegame.com:{port}?team=0` (TEAM 1)'
-    cmd2 = f'`open syco.servegame.com:{port}?team=1` (TEAM 2)'
+# gets a message with commands to join a server game
+def server_commands_msg(address, port):
+    cmd1 = f'`open {address}:{port}?team=0` (TEAM 1)'
+    cmd2 = f'`open {address}:{port}?team=1` (TEAM 2)'
     msg_lines = [cmd1]
     if current_match and current_match.final_team1_names:
         msg_lines.append(current_match.final_team1_names)
@@ -1236,6 +1454,22 @@ def syco_commands_msg(port):
     if current_match and current_match.final_team2_names:
         msg_lines.append(current_match.final_team2_names)
     return '\n'.join(msg_lines)
+
+# gets a message with commands to join an anhur server game
+def anhur_commands_msg(port):
+    return server_commands_msg('anhur.servegame.com', port)
+
+# gets a message with commands to join a floof server game
+def floof_commands_msg(port):
+    return server_commands_msg('floof.servegame.com', port)
+
+# gets a message with commands to join a syco server game
+def syco_commands_msg(port):
+    return server_commands_msg('syco.servegame.com', port)
+
+# gets a message with commands to join a custom server game
+def custom_server_commands_msg(port):
+    return server_commands_msg(custom_server_address, port)
 
 # gets a block of text to explain how to search a user's match history
 def match_history_block(user):
@@ -1253,18 +1487,21 @@ def command_help_block():
     lines = '\n'.join([chelp for cname, chelp in command_help.items()])
     return f'```{lines}```'
 
+# checks if a user is configured as an admin
+def is_user_admin(ctx):
+    return ctx.message.author.id in admin_ids
+
 # Command to end the PUG system
 @bot.command(name='end_pug')
 async def end_pug_cmd(ctx):
+   log_async_start('end_pug_cmd')
    global phase, waiting_room, matches, current_match, results_match, game_in_progress, queue_message
+   if not is_user_admin(ctx):
+       await ctx.send('You do not have permission to use this command.', ephemeral=True, delete_after=msg_fade1)
+       return
    if game_in_progress or queue_message:
-       print(f'{get_timestamp()} - ending PUGs')
-       try:
-          with open(save_file_path, 'w') as save_file:
-             save_pug(save_file)
-       except:
-          print(f'{get_timestamp()} - Error saving PUG data.')
-       print(f'{get_timestamp()} - PUG saved on match #{match_number} with {total_queue_size()} players in queue.')
+       log_msg(LogLevel.NONE, 'Ending PUGs')
+       try_save_pug() # save pug state to file
        # Reset the game state
        reset_game()
        phase = Phase.NONE
@@ -1275,27 +1512,33 @@ async def end_pug_cmd(ctx):
        await ctx.send('The current PUG session has been ended. You can start a new queue with `!start_pug`.')
    else:
        await ctx.send('No PUG session is currently active.')
+   log_async_end('end_pug_cmd')
 
 
 # Command to start the PUG system
 @bot.command(name='start_pug')
 async def start_pug_cmd(ctx):
-   global phase, queue, queue_message, game_in_progress
+   log_async_start('start_pug_cmd')
+   global queue_channel_id, phase, queue, queue_message, game_in_progress
+   if not is_user_admin(ctx):
+       await ctx.send('You do not have permission to use this command.', ephemeral=True, delete_after=msg_fade1)
+       return
    if not game_in_progress and not queue_message:
-      print(f'{get_timestamp()} - starting PUGs')
+      log_msg(LogLevel.NONE, 'Starting PUGs')
       phase = Phase.QUEUE
       # load data if it exists
       if os.path.isfile(save_file_path):
          queue = []
          try:
             with open(save_file_path, 'r') as save_file:
-               load_pug(ctx, save_file)
-            print(f'{get_timestamp()} - PUG loaded on match #{match_number} with {total_queue_size()} players in queue.')
-            os.remove(save_file_path)
+               load_pug(ctx.message.guild, save_file)
+            log_msg(LogLevel.NONE, f'PUG loaded on match #{match_number} with {total_queue_size()} players in queue')
+            #os.remove(save_file_path)
          except:
-            print(f'{get_timestamp()} - Failed to load saved PUG: {save_file_path}')
-            queue = []   
-            
+            log_msg(LogLevel.ERROR, f'Failed to load saved PUG: {save_file_path}') 
+            queue = []
+      
+      queue_channel_id = ctx.message.channel.id # save channel that command was used
       # send queue message
       embed = queue_embed()
       queue_message = await ctx.send(embed=embed, view=QueueView())
@@ -1303,38 +1546,114 @@ async def start_pug_cmd(ctx):
       await check_full_queue()
    else:
        await ctx.send('A match is already in progress or the queue is active.')
+   log_async_end('start_pug_cmd')
+
+# Command to show the server join commands for anhur.servegame.com port 7777
+@bot.command(name='a7')
+async def a7_cmd(ctx):
+    log_async_start('a7_cmd')
+    await ctx.send(anhur_commands_msg(7777))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('a7_cmd')
+    
+# Command to show the server join commands for anhur.servegame.com port 7778
+@bot.command(name='a8')
+async def a8_cmd(ctx):
+    log_async_start('a8_cmd')
+    await ctx.send(anhur_commands_msg(7778))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('a8_cmd')
+
+# Command to show the server join commands for floof.servegame.com port 7777
+@bot.command(name='f7')
+async def f7_cmd(ctx):
+    log_async_start('f7_cmd')
+    await ctx.send(floof_commands_msg(7777))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('f7_cmd')
+    
+# Command to show the server join commands for floof.servegame.com port 7778
+@bot.command(name='f8')
+async def f8_cmd(ctx):
+    log_async_start('f8_cmd')
+    await ctx.send(floof_commands_msg(7778))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('f8_cmd')
 
 # Command to show the server join commands for syco.servegame.com port 7777
 @bot.command(name='s7')
 async def s7_cmd(ctx):
+    log_async_start('s7_cmd')
     await ctx.send(syco_commands_msg(7777))
     if current_match:
         current_match.update_start_time()
+    log_async_end('s7_cmd')
     
 # Command to show the server join commands for syco.servegame.com port 7778
 @bot.command(name='s8')
 async def s8_cmd(ctx):
+    log_async_start('s8_cmd')
     await ctx.send(syco_commands_msg(7778))
     if current_match:
         current_match.update_start_time()
+    log_async_end('s8_cmd')
     
 # Command to show the server join commands for syco.servegame.com port 7779
 @bot.command(name='s9')
 async def s9_cmd(ctx):
+    log_async_start('s9_cmd')
     await ctx.send(syco_commands_msg(7779))
     if current_match:
         current_match.update_start_time()
+    log_async_end('s9_cmd')
     
 # Command to show the server join commands for syco.servegame.com port 7780
 @bot.command(name='s0')
 async def s0_cmd(ctx):
+    log_async_start('s0_cmd')
     await ctx.send(syco_commands_msg(7780))
     if current_match:
         current_match.update_start_time()
+    log_async_end('s0_cmd')
+
+# Command to set the custom server used for c7 and c8 commands
+@bot.command(name='custom_server')
+async def custom_server_cmd(ctx, address: str = ''):
+    log_async_start('custom_server_cmd')
+    global custom_server_address
+    custom_server_address = address
+    await ctx.send(f'Custom server address has been set to: {custom_server_address}')
+    log_async_end('custom_server_cmd')
+
+# Command to show the server join commands for the custom server port 7777
+@bot.command(name='c7')
+async def c7_cmd(ctx):
+    log_async_start('c7_cmd')
+    await ctx.send(custom_server_commands_msg(7777))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('c7_cmd')
+    
+# Command to show the server join commands for the custom server port 7778
+@bot.command(name='c8')
+async def c8_cmd(ctx):
+    log_async_start('c8_cmd')
+    await ctx.send(custom_server_commands_msg(7778))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('c8_cmd')
 
 # Command to manually add users to the queue
 @bot.command(name='queue_users')
 async def queue_users_cmd(ctx, members: commands.Greedy[discord.Member]):
+    log_async_start('queue_users_cmd')
+    if not is_user_admin(ctx):
+       await ctx.send('You do not have permission to use this command.', ephemeral=True, delete_after=msg_fade1)
+       return
     if queue_message:
         total_added = 0
         for member in members:
@@ -1351,24 +1670,31 @@ async def queue_users_cmd(ctx, members: commands.Greedy[discord.Member]):
             await update_waiting_room_message()
         else:
             await update_queue_message()
+        try_save_pug() # save state automatically
     else:
         await ctx.send('Cannot queue players, queue message not found.')
+    log_async_end('queue_users_cmd')
 
 # Command to set custom team 1
 @bot.command(name='ct1')
 async def ct1_cmd(ctx, members: commands.Greedy[discord.Member]):
+    log_async_start('ct1_cmd')
     if not current_match:
         await ctx.send('Cannot set custom teams until players are in a match.')
+        log_async_end('ct1_cmd')
         return
     if current_match.phase > Phase.PLAY:
         await ctx.send('Cannot set custom teams once a match is complete.')
+        log_async_end('ct1_cmd')
         return
     if current_match.phase == Phase.PLAY and current_match.selected_matchup != custom_teams_key:
         await ctx.send('Cannot set custom teams once a non-custom matchup has won the vote.')
+        log_async_end('ct1_cmd')
         return
     players_in_match = [p for p in members if p in current_match.players]
     if len(players_in_match) != team_size:
         await ctx.send(f'Must set a custom team of {team_size} players in the current match.')
+        log_async_end('ct1_cmd')
         return 
     current_match.custom_team1 = list(players_in_match)
     current_match.custom_team2 = list(set(current_match.players) - set(current_match.custom_team1))
@@ -1376,22 +1702,28 @@ async def ct1_cmd(ctx, members: commands.Greedy[discord.Member]):
     custom_team1_names = ', '.join([get_display_name(user) for user in current_match.custom_team1])
     custom_team2_names = ', '.join([get_display_name(user) for user in current_match.custom_team2])
     await ctx.send(f'Custom Team 1 has been set to: {custom_team1_names}.\nCustom Team 2 has been set to: {custom_team2_names}.')
+    log_async_end('ct1_cmd')
 
 # Command to set custom team 2
 @bot.command(name='ct2')
 async def ct2_cmd(ctx, members: commands.Greedy[discord.Member]):
+    log_async_start('ct2_cmd')
     if not current_match:
         await ctx.send('Cannot set custom teams until players are in a match.')
+        log_async_end('ct2_cmd')
         return
     if current_match.phase > Phase.PLAY:
         await ctx.send('Cannot set custom teams once a match is complete.')
+        log_async_end('ct2_cmd')
         return
     if current_match.phase == Phase.PLAY and current_match.selected_matchup != custom_teams_key:
         await ctx.send('Cannot set custom teams once a non-custom matchup has won the vote.')
+        log_async_end('ct2_cmd')
         return
     players_in_match = [p for p in members if p in current_match.players]
     if len(players_in_match) != team_size:
         await ctx.send(f'Must set a custom team of {team_size} players in the current match.')
+        log_async_end('ct2_cmd')
         return 
     current_match.custom_team2 = list(players_in_match)
     current_match.custom_team1 = list(set(current_match.players) - set(current_match.custom_team2))
@@ -1399,24 +1731,30 @@ async def ct2_cmd(ctx, members: commands.Greedy[discord.Member]):
     custom_team1_names = ', '.join([get_display_name(user) for user in current_match.custom_team1])
     custom_team2_names = ', '.join([get_display_name(user) for user in current_match.custom_team2])
     await ctx.send(f'Custom Team 1 has been set to: {custom_team1_names}.\nCustom Team 2 has been set to: {custom_team2_names}.')
+    log_async_end('ct2_cmd')
 
 # Command to trade two players on opposite teams
 @bot.command(name='trade')
 async def trade_cmd(ctx, members: commands.Greedy[discord.Member]):
+    log_async_start('trade_cmd')
     if not current_match:
         await ctx.send('Cannot trade players until players are in a match.')
+        log_async_end('trade_cmd')
         return
     if current_match.phase <= Phase.MATCHUP:
         await ctx.send('Cannot trade players until a final matchup has been set.')
+        log_async_end('trade_cmd')
         return
     if current_match.phase > Phase.PLAY:
         await ctx.send('Cannot trade players once a match is complete.')
+        log_async_end('trade_cmd')
         return
     # find which players are on which team
     team1_players = [p for p in members if p in current_match.final_team1]
     team2_players = [p for p in members if p in current_match.final_team2]
     if len(team1_players) != 1 or len(team2_players) != 1:
         await ctx.send(f'Must trade two players on opposite teams.')
+        log_async_end('trade_cmd')
         return
     p1 = team1_players[0]
     p2 = team2_players[0]
@@ -1424,22 +1762,27 @@ async def trade_cmd(ctx, members: commands.Greedy[discord.Member]):
     replace_list_item(current_match.final_team1, p1, p2)
     replace_list_item(current_match.final_team2, p2, p1)
     await current_match.on_final_teams_changed(ctx.message.channel)
-    await ctx.send(f'{get_display_name(p1)} and {get_display_name(p2)} have traded teams.')
+    await ctx.send(f'{get_display_name(p1)} has been traded to Team 2 and {get_display_name(p2)} has been traded to Team 1.')
+    log_async_end('trade_cmd')
 
 # Command to replace a player in the match with one not in the match
 @bot.command(name='fill')
 async def fill_cmd(ctx, members: commands.Greedy[discord.Member]):
+    log_async_start('fill_cmd')
     if not current_match:
         await ctx.send('Cannot fill for a player until players are in a match.')
+        log_async_end('fill_cmd')
         return
     if current_match.phase > Phase.PLAY:
         await ctx.send('Cannot fill for a player once a match is complete.')
+        log_async_end('fill_cmd')
         return
     # find which players are in the match
     in_players = [p for p in members if p in current_match.players]
     out_players = [p for p in members if p not in current_match.players]
     if len(in_players) != 1 or len(out_players) != 1:
         await ctx.send(f'Must fill a player in the match with one not in the match.')
+        log_async_end('fill_cmd')
         return
     p_in = in_players[0]  # player in match
     p_out = out_players[0]  # player not in match
@@ -1453,47 +1796,71 @@ async def fill_cmd(ctx, members: commands.Greedy[discord.Member]):
         await update_waiting_room_message()
     else:
         await update_queue_message()
+    try_save_pug() # save state automatically
+    log_async_end('fill_cmd')
 
 # Command to set scoreboard
 @bot.command(name='sb')
 async def sb_cmd(ctx, score_str: str = 'x'):
+    log_async_start('sb_cmd')
     if not results_match:
         await ctx.send('Cannot update scoreboard, no match is active.')
+        log_async_end('sb_cmd')
         return
     if not ctx.message.attachments:
         await ctx.send('No image attached, must attach an image of the scoreboard.')
+        log_async_end('sb_cmd')
         return
     if not ctx.message.attachments[0].content_type.startswith('image'):
         await ctx.send(f'Must attach an image, you attached a {ctx.message.attachments[0].content_type}.')
+        log_async_end('sb_cmd')
+        return
+    # check file size
+    size_mb = ctx.message.attachments[0].size / 1000000
+    if size_mb >= 10:
+        await ctx.send(f'Image must be less than 10 MB, you attached a {size_mb} MB image.')
+        log_async_end('sb_cmd')
         return
     
     # convert attached image to a file to attach to our own message
     scoreboard_file = await ctx.message.attachments[0].to_file()
+    #sb_filename = f'sb/sb{results_match.match_number}.png'
+    #sb_saved = await ctx.message.attachments[0].save(sb_filename)
+    #scoreboard_file = discord.File(sb_filename)
     await results_match.update_scoreboard(ctx, scoreboard_file)
+    #os.remove(sb_filename)  # delete scoreboard file
     
     try:
         score = int(score_str)
     except ValueError:
+        log_async_end('sb_cmd')
         return
     await results_match.update_wounds(ctx, score)
+    log_async_end('sb_cmd')
 
 # Alternate command for capital letters
 @bot.command(name='SB')
 async def sb_caps_cmd(ctx, score_str: str = 'x'):
+    log_async_start('sb_caps_cmd')
     await sb_cmd(ctx, score_str)
+    log_async_end('sb_caps_cmd')
     
 # Command to set remaining wounds score
 @bot.command(name='wounds')
 async def wounds_cmd(ctx, score_str: str = 'x'):
+    log_async_start('wounds_cmd')
     if not results_match:
         await ctx.send('Cannot update wounds, no match is active.')
+        log_async_end('wounds_cmd')
         return
     try:
         score = int(score_str)
     except ValueError:
         await ctx.send(f'Unable to parse number of wounds from !wounds {score_str}.')
+        log_async_end('wounds_cmd')
         return
     await results_match.update_wounds(ctx, score) 
+    log_async_end('wounds_cmd')
 
 # Run the bot
 bot.run(TOKEN)
