@@ -105,6 +105,8 @@ command_help = {  # Help info for commands
     's8': '!s8 - show the server join commands for syco.servegame.com port 7778',
     's9': '!s9 - show the server join commands for syco.servegame.com port 7779',
     's0': '!s0 - show the server join commands for syco.servegame.com port 7780',
+    's17': '!s17 - show the server join commands for syco.servegame.com port 17777',
+    's18': '!s18 - show the server join commands for syco.servegame.com port 17778',
     'custom_server': '!custom_server - set the address for the custom server used with c7 and c8 commands',
     'c7': '!c7 - show the server join commands for the custom server port 7777',
     'c8': '!c8 - show the server join commands for the custom server port 7778',
@@ -576,8 +578,10 @@ class PugMatch():  # holds data for a single pug match
     # replaces a player in the match
     async def replace_player(self, p_out, p_in, channel):
         log_async_start('replace_player')
-        replace_list_item(self.players, p_out, p_in)
-        replace_list_item(self.re_queue, p_out, p_in)
+        if p_out in self.players:
+            replace_list_item(self.players, p_out, p_in)
+        if p_out in self.re_queue:
+            replace_list_item(self.re_queue, p_out, p_in)
         if self.phase == Phase.MAP:
             if p_out in self.map_voted_users:  # remove map vote
                 previous_vote = self.map_voted_users[p_out]
@@ -1619,6 +1623,24 @@ async def s0_cmd(ctx):
     if current_match:
         current_match.update_start_time()
     log_async_end('s0_cmd')
+
+# Command to show the server join commands for syco.servegame.com port 17777
+@bot.command(name='s17')
+async def s17_cmd(ctx):
+    log_async_start('s17_cmd')
+    await ctx.send(syco_commands_msg(17777))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('s17_cmd')
+
+# Command to show the server join commands for syco.servegame.com port 17778
+@bot.command(name='s18')
+async def s18_cmd(ctx):
+    log_async_start('s18_cmd')
+    await ctx.send(syco_commands_msg(17778))
+    if current_match:
+        current_match.update_start_time()
+    log_async_end('s18_cmd')
 
 # Command to set the custom server used for c7 and c8 commands
 @bot.command(name='custom_server')
