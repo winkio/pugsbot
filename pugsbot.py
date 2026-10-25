@@ -21,77 +21,6 @@ from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
 
-# TODO
-# v4
-# DONE sort names ignoring case
-# DONE remove bail out button
-# DONE reroll should avoid giving previous matchups
-# v5
-# DONE fix double map vote
-# DONE move matchup titles above each matchup
-# DONE queue permanently joinable, automatic waiting room
-# DONE automatically requeue players after a game ends unless they click a button
-# v6
-# DONE code cleanup
-# DONE de-clutter messages
-#   DONE make unimportant bot messages delete after a few seconds
-#   DONE show reset votes on waiting room instead of in message
-# DONE save/load waiting room and requeue
-# DONE randomize order of players put into re-queue
-# DONE re-add bailout button during ready phase with fill functionality
-#   DONE waiting room players can ready up to be 'on standby', taking open spots without a requeue
-# v7
-# DONE custom teams button
-# DONE command to set custom teams
-# v8
-# DONE sort custom teams alphabetically
-# DONE recreate queue message after ready up phase completes
-# DONE green checkmark on winning votes after votes complete
-# DONE keep reference to final matchup message
-# DONE Match number, increments with each match, saves and loads
-# DONE rename !customt1 and 2 to !ct1 and 2
-# DONE !ct1 sets team2 to leftover players
-# DONE !sb command to update scoreboard
-# DONE add mentions to final matchup for searchable match history
-# DONE !mh command to get a search string for your discord user
-# DONE !pughelp command to get a list of public commands
-# DONE !wounds commands to report winner and wound score
-# DONE timestamps and total match length on final match embed
-# DONE config activity name, move config above bot init
-# v9
-# DONE match history button
-# DONE help button
-# DONE queue kill comments
-# v10
-# DONE fix bug with !ct1 command not actually setting team 2
-# DONE add !SB command that does same as !sb
-# DONE more accurate match time
-# DONE rewrite match handling to be contained in a class that can be instanced per-match
-# DONE store recent matches in memory
-# DONE update match scoreboard and wounds after marked complete
-# DONE requeue order sorted by recent play time, number of games, or number of wounds
-# DONE !trade command to trade players between teams in final matchup
-# DONE !fill command to replace a player in the match with one not in the match
-# v11
-# DONE prevent loading duplicate users into queue when starting pug
-# DONE added custom server commands so that if servers change we don't need a new build
-# DONE fixed requeue sort order
-# DONE added logging levels
-# DONE configure admin users and reserve certain commands for them
-# DONE automatically save pug state when phase changes
-# DONE shell scripts that can be ran by cron job to automatically check if bot is running and restart if needed
-# DONE keep track of queue channel
-# DONE automatically restart pugs on startup
-# DONE added support for custom ports for custom servers
-# v12
-# DONE split saved files into config and players
-# DONE set creature commands
-# DONE set server commands (for server setup)
-# automatically send request to server to start map
-# update scoredboard image to reupload full file
-# allow multiple matches
-# votes for match balance when resetting queue
-
 # Load the bot token from the .env file
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -1777,7 +1706,7 @@ def match_history_block(user):
 `pug_mh from: {botname} mentions: {username}`
 - this tracks your discord account, so changing your nickname or in-game name is still ok
 - add a map name to the search string to only view games on that map
-- add `before:` `during:` or `after:` to search a sepcific date range
+- add `before:` `during:` or `after:` to search a specific date range
 - add a match number to the search string to view that exact match number'''
 
 # checks if a user is configured as an admin
