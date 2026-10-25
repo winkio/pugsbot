@@ -191,7 +191,7 @@ user_setting_defaults = {
 user_settings = {}  # user id -> {setting name: value} with only the settings that user has changed, saved in user_settings_file_path
 msg_fade1 = config_value('msg_fade1', 8)  # very simple ephemeral messages auto-delete after this many seconds
 msg_fade2 = config_value('msg_fade2', 30)  # simple ephemeral messages auto-delete after this many seconds
-help_url = config_value('help_url', 'https://csharpgamedev.com/bots/help/')  # web page that lists the commands
+help_url = config_value('help_url', 'https://github.com/winkio/pugsbot/blob/main/docs/commands.md')  # web page that lists the commands
 ready_alarm_image_url = config_value('ready_alarm_image_url', 'https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExYzZiN3dyOGZkYjA3Z2sxM3FsNjBpOGJuaGdjN2x6NDNhNDk3Yng2aCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/KxBFk4ksGxJ2W8N6jg/giphy.gif')  # image for !readyalarm
 re_queue_order = config_enum('re_queue_order', RequeueOrder, 'NUM_WOUNDS')  # order to use when re-queueing players in a match, one of the RequeueOrder names
 recent_time = timedelta(hours=config_value('recent_time_hours', 3))  # if ordering by playtime or wounds, only look at games in this many hours
