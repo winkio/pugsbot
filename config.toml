@@ -1,0 +1,21 @@
+# Settings for the bot (pugsbot.py reads this file when it starts).
+# A setting that is not listed here uses the default in the code. Those defaults are the
+# 10 player values: queue_size_required 10, team_size 5, reset_queue_votes_required 4,
+# votes_required 5, map_total_votes_required 7.
+
+activity_name = 'Gigantic PUGs'        # the bot shows as playing this
+
+# Web page that lists the commands. The Help button and the bot's "how to use it" error messages link to it.
+# help_url = 'https://example.com/help/'
+
+# admin_ids is a list of Discord user ids of the admins, who can use !start_pug, !end_pug and !queue_users.
+# Nobody is an admin if it is left out.
+
+# These settings can be added here too. They are not listed because the defaults are fine,
+# which are in the config_value, config_list, config_enum and config_creature calls in pugsbot.py
+# along with what each one does:
+#   log_level, ready_up_time, msg_fade1, msg_fade2, ready_alarm_image_url,
+#   re_queue_order, recent_time_hours, max_matches_in_memory, vote_pip, vote_win_pip,
+#   server_request_timeout, save_file_path, save_players_file_path, user_settings_file_path, default_max_players,
+#   default_creature1, default_creature2, default_creature3, default_creature3r,
+#   ready_dm_messages, map_vote_dm_message, join_dm_message
